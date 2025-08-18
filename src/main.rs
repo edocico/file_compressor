@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 /// Un programma per comprimere e decomprimere file con l'algoritmo Zstandard
@@ -57,27 +57,33 @@ fn compress_file(input_path: &PathBuf, level: i32) -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "File di input non trovato"));
     }
     
-    // Crea il nome del file di output (es. 'mio_file.txt' -> 'mio_file.txt.zst')
-    let output_path = input_path.as_os_str().to_str().unwrap().to_string() + ".zst";
+    // Crea il nome del file di output usando OsString per evitare allocazioni
+    let mut output_path = input_path.as_os_str().to_owned();
+    output_path.push(".zst");
     println!("File di input: {:?}", input_path);
-    println!("File di output: {}", output_path);
+    println!("File di output: {:?}", output_path);
     println!("Livello di compressione: {}", level);
 
-    // Legge il file di input
-    let mut input_file = File::open(input_path)?;
-    let mut buffer = Vec::new();
-    input_file.read_to_end(&mut buffer)?;
-
-    // Comprime i dati
-    let compressed_data = zstd::encode_all(&buffer[..], level)?;
-
-    // Scrive i dati compressi nel file di output
-    let mut output_file = File::create(output_path)?;
-    output_file.write_all(&compressed_data)?;
+    // Usa streaming compression per file grandi
+    let input_file = File::open(input_path)?;
+    let output_file = File::create(&output_path)?;
+    
+    let mut reader = BufReader::with_capacity(64 * 1024, input_file); // 64KB buffer
+    let mut writer = BufWriter::with_capacity(64 * 1024, output_file); // 64KB buffer
+    
+    // Usa streaming encoder per evitare di caricare tutto in memoria
+    let mut encoder = zstd::Encoder::new(&mut writer, level)?;
+    std::io::copy(&mut reader, &mut encoder)?;
+    encoder.finish()?;
+    
+    // Forza il flush del buffer
+    writer.flush()?;
 
     println!("\n✅ Compressione completata con successo!");
-    let input_size = buffer.len() as f64 / 1_048_576.0; // in MB
-    let output_size = compressed_data.len() as f64 / 1_048_576.0; // in MB
+    
+    // Calcola le dimensioni dei file per statistiche
+    let input_size = std::fs::metadata(input_path)?.len() as f64 / 1_048_576.0;
+    let output_size = std::fs::metadata(&output_path)?.len() as f64 / 1_048_576.0;
     println!("Dimensione originale: {:.2} MB -> Dimensione compressa: {:.2} MB", input_size, output_size);
 
     Ok(())
@@ -95,17 +101,19 @@ fn decompress_file(input_path: &PathBuf) -> std::io::Result<()> {
     println!("File di input: {:?}", input_path);
     println!("File di output: {:?}", output_path);
 
-    // Legge il file compresso
-    let mut input_file = File::open(input_path)?;
-    let mut compressed_buffer = Vec::new();
-    input_file.read_to_end(&mut compressed_buffer)?;
-
-    // Decomprime i dati
-    let decompressed_data = zstd::decode_all(&compressed_buffer[..])?;
-
-    // Scrive i dati decompressi nel file di output
-    let mut output_file = File::create(output_path)?;
-    output_file.write_all(&decompressed_data)?;
+    // Usa streaming decompression per file grandi
+    let input_file = File::open(input_path)?;
+    let output_file = File::create(&output_path)?;
+    
+    let mut reader = BufReader::with_capacity(64 * 1024, input_file); // 64KB buffer
+    let mut writer = BufWriter::with_capacity(64 * 1024, output_file); // 64KB buffer
+    
+    // Usa streaming decoder per evitare di caricare tutto in memoria
+    let mut decoder = zstd::Decoder::new(&mut reader)?;
+    std::io::copy(&mut decoder, &mut writer)?;
+    
+    // Forza il flush del buffer
+    writer.flush()?;
 
     println!("\n✅ Decompressione completata con successo!");
 
