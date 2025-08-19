@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 /// Un programma per comprimere e decomprimere file con l'algoritmo Zstandard
