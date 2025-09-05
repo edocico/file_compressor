@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::ffi::OsString;
 
 /// Un programma per comprimere e decomprimere file con l'algoritmo Zstandard
 #[derive(Parser, Debug)]
@@ -20,15 +21,37 @@ enum Commands {
         input_file: PathBuf,
 
         /// Livello di compressione (da 1 a 21)
-        #[arg(short, long, default_value_t = 3)]
+        #[arg(short, long, default_value_t = 3, value_parser = parse_level, value_name = "LIVELLO")]
         livello: i32,
+
+        /// Sovrascrive il file di output se esiste già
+        #[arg(short, long)]
+        force: bool,
     },
     /// Decomprime un file con estensione .zst
     Decompress {
         /// Il file .zst da decomprimere
         #[arg(value_name = "FILE")]
         input_file: PathBuf,
+
+        /// Sovrascrive il file di output se esiste già
+        #[arg(short, long)]
+        force: bool,
     },
+}
+
+fn parse_level(s: &str) -> Result<i32, String> {
+    let v: i32 = s.parse().map_err(|_| {
+        format!("Valore '{}' non valido: specifica un intero tra 1 e 21", s)
+    })?;
+    if (1..=21).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "Livello {} fuori intervallo: usa un valore tra 1 e 21",
+            v
+        ))
+    }
 }
 
 fn main() {
@@ -37,13 +60,13 @@ fn main() {
 
     // Esegue l'azione in base al sottocomando fornito (compress o decompress)
     match &cli.command {
-        Commands::Compress { input_file, livello } => {
-            if let Err(e) = compress_file(input_file, *livello) {
+        Commands::Compress { input_file, livello, force } => {
+            if let Err(e) = compress_file(input_file.as_path(), *livello, *force) {
                 eprintln!("Errore durante la compressione: {}", e);
             }
         }
-        Commands::Decompress { input_file } => {
-            if let Err(e) = decompress_file(input_file) {
+        Commands::Decompress { input_file, force } => {
+            if let Err(e) = decompress_file(input_file.as_path(), *force) {
                 eprintln!("Errore durante la decompressione: {}", e);
             }
         }
@@ -51,15 +74,28 @@ fn main() {
 }
 
 /// Funzione per comprimere un file
-fn compress_file(input_path: &PathBuf, level: i32) -> std::io::Result<()> {
-    // Controlla che il file esista
-    if !input_path.exists() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "File di input non trovato"));
+fn compress_file(input_path: &Path, level: i32, force: bool) -> std::io::Result<()> {
+    // Costruisci il percorso di output:
+    // se il file ha estensione, aggiunge ".zst" all'estensione corrente (es. file.txt -> file.txt.zst)
+    // altrimenti imposta estensione "zst" (es. file -> file.zst)
+    let output_path = match input_path.extension() {
+        Some(ext) => {
+            let mut new_ext: OsString = ext.to_os_string();
+            new_ext.push(".zst");
+            input_path.with_extension(new_ext)
+        }
+        None => input_path.with_extension("zst"),
+    };
+    if output_path.exists() && !force {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "Il file di output {:?} esiste già. Usa --force per sovrascrivere.",
+                output_path
+            ),
+        ));
     }
-    
-    // Crea il nome del file di output usando OsString per evitare allocazioni
-    let mut output_path = input_path.as_os_str().to_owned();
-    output_path.push(".zst");
+
     println!("File di input: {:?}", input_path);
     println!("File di output: {:?}", output_path);
     println!("Livello di compressione: {}", level);
@@ -90,7 +126,7 @@ fn compress_file(input_path: &PathBuf, level: i32) -> std::io::Result<()> {
 }
 
 /// Funzione per decomprimere un file
-fn decompress_file(input_path: &PathBuf) -> std::io::Result<()> {
+fn decompress_file(input_path: &Path, force: bool) -> std::io::Result<()> {
     // Controlla che il file abbia l'estensione .zst
     if input_path.extension().and_then(std::ffi::OsStr::to_str) != Some("zst") {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Il file di input deve avere estensione .zst"));
@@ -100,6 +136,17 @@ fn decompress_file(input_path: &PathBuf) -> std::io::Result<()> {
     let output_path = input_path.with_extension("");
     println!("File di input: {:?}", input_path);
     println!("File di output: {:?}", output_path);
+
+    if output_path.exists() && !force {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "Il file di output {:?} esiste già. Usa --force per sovrascrivere.",
+                output_path
+            ),
+        ));
+    }
+
 
     // Usa streaming decompression per file grandi
     let input_file = File::open(input_path)?;
