@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::ffi::OsString;
+use std::process;
 
 /// Un programma per comprimere e decomprimere file con l'algoritmo Zstandard
 #[derive(Parser, Debug)]
@@ -59,22 +60,32 @@ fn main() {
     let cli = Cli::parse();
 
     // Esegue l'azione in base al sottocomando fornito (compress o decompress)
-    match &cli.command {
+    let result = match &cli.command {
         Commands::Compress { input_file, livello, force } => {
-            if let Err(e) = compress_file(input_file.as_path(), *livello, *force) {
-                eprintln!("Errore durante la compressione: {}", e);
-            }
+            compress_file(input_file.as_path(), *livello, *force)
         }
         Commands::Decompress { input_file, force } => {
-            if let Err(e) = decompress_file(input_file.as_path(), *force) {
-                eprintln!("Errore durante la decompressione: {}", e);
-            }
+            decompress_file(input_file.as_path(), *force)
         }
+    };
+
+    // Gestisce gli errori con exit code appropriato
+    if let Err(e) = result {
+        eprintln!("Errore: {}", e);
+        process::exit(1);
     }
 }
 
 /// Funzione per comprimere un file
 fn compress_file(input_path: &Path, level: i32, force: bool) -> std::io::Result<()> {
+    // Verifica che il file di input esista
+    if !input_path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Il file di input {:?} non esiste", input_path)
+        ));
+    }
+
     // Costruisci il percorso di output:
     // se il file ha estensione, aggiunge ".zst" all'estensione corrente (es. file.txt -> file.txt.zst)
     // altrimenti imposta estensione "zst" (es. file -> file.zst)
@@ -110,10 +121,8 @@ fn compress_file(input_path: &Path, level: i32, force: bool) -> std::io::Result<
     // Usa streaming encoder per evitare di caricare tutto in memoria
     let mut encoder = zstd::Encoder::new(&mut writer, level)?;
     std::io::copy(&mut reader, &mut encoder)?;
+    // encoder.finish() chiude l'encoder e fa automaticamente il flush del writer
     encoder.finish()?;
-    
-    // Forza il flush del buffer
-    writer.flush()?;
 
     println!("\n✅ Compressione completata con successo!");
     
@@ -127,12 +136,21 @@ fn compress_file(input_path: &Path, level: i32, force: bool) -> std::io::Result<
 
 /// Funzione per decomprimere un file
 fn decompress_file(input_path: &Path, force: bool) -> std::io::Result<()> {
+    // Verifica che il file di input esista
+    if !input_path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Il file di input {:?} non esiste", input_path)
+        ));
+    }
+
     // Controlla che il file abbia l'estensione .zst
     if input_path.extension().and_then(std::ffi::OsStr::to_str) != Some("zst") {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Il file di input deve avere estensione .zst"));
     }
 
     // Crea il nome del file di output rimuovendo l'estensione .zst
+    // Gestisce correttamente sia "file.txt.zst" -> "file.txt" che "file.zst" -> "file"
     let output_path = input_path.with_extension("");
     println!("File di input: {:?}", input_path);
     println!("File di output: {:?}", output_path);
@@ -158,11 +176,16 @@ fn decompress_file(input_path: &Path, force: bool) -> std::io::Result<()> {
     // Usa streaming decoder per evitare di caricare tutto in memoria
     let mut decoder = zstd::Decoder::new(&mut reader)?;
     std::io::copy(&mut decoder, &mut writer)?;
-    
+
     // Forza il flush del buffer
     writer.flush()?;
 
     println!("\n✅ Decompressione completata con successo!");
+
+    // Calcola le dimensioni dei file per statistiche
+    let input_size = std::fs::metadata(input_path)?.len() as f64 / 1_048_576.0;
+    let output_size = std::fs::metadata(&output_path)?.len() as f64 / 1_048_576.0;
+    println!("Dimensione compressa: {:.2} MB -> Dimensione originale: {:.2} MB", input_size, output_size);
 
     Ok(())
 }
