@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- File base -->
+  <path d="M12 4 L40 4 L52 16 L52 60 L12 60 Z" fill="#4a90d9" stroke="#2d5a87" stroke-width="2"/>
+  <!-- Fold corner -->
+  <path d="M40 4 L40 16 L52 16" fill="#3a7bc8" stroke="#2d5a87" stroke-width="2"/>
+  <!-- Compression arrows -->
+  <g fill="#ffffff" stroke="#ffffff" stroke-width="1">
+    <!-- Top arrow down -->
+    <path d="M32 24 L38 30 L34 30 L34 36 L30 36 L30 30 L26 30 Z"/>
+    <!-- Bottom arrow up -->
+    <path d="M32 52 L26 46 L30 46 L30 40 L34 40 L34 46 L38 46 Z"/>
+  </g>
+  <!-- Compression lines -->
+  <rect x="24" y="36" width="16" height="2" fill="#ffffff" opacity="0.7"/>
+  <rect x="24" y="40" width="16" height="2" fill="#ffffff" opacity="0.7"/>
+</svg>
