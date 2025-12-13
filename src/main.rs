@@ -1,9 +1,16 @@
 use clap::{Parser, Subcommand};
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use file_compressor::{
+    compress_directory, compress_file, compress_file_simple, compress_multiple_files,
+    count_files_in_dir, decompress_single_file, decompress_tar_zst, format_ratio, format_size,
+    parse_level, verify_zst, CompressOptions, DecompressOptions, ProgressCallback,
+};
+use glob::glob;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::ffi::OsString;
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Un programma per comprimere e decomprimere file con l'algoritmo Zstandard
 #[derive(Parser, Debug)]
@@ -15,9 +22,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Comprime un file
+    /// Comprime un file o una directory
     Compress {
-        /// Il file da comprimere
+        /// Il file o la directory da comprimere
         #[arg(value_name = "FILE")]
         input_file: PathBuf,
 
@@ -28,8 +35,12 @@ enum Commands {
         /// Sovrascrive il file di output se esiste già
         #[arg(short, long)]
         force: bool,
+
+        /// Usa compressione multi-threaded per file grandi
+        #[arg(short, long)]
+        parallel: bool,
     },
-    /// Decomprime un file con estensione .zst
+    /// Decomprime un file con estensione .zst o .tar.zst
     Decompress {
         /// Il file .zst da decomprimere
         #[arg(value_name = "FILE")]
@@ -39,373 +50,424 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Comprime più file in un archivio tar.zst
+    MultiCompress {
+        /// I file da comprimere
+        #[arg(value_name = "FILES", num_args = 1..)]
+        input_files: Vec<PathBuf>,
+
+        /// Nome del file di output (default: archivio.tar.zst)
+        #[arg(short, long, default_value = "archivio.tar.zst")]
+        output: PathBuf,
+
+        /// Livello di compressione (da 1 a 21)
+        #[arg(short, long, default_value_t = 3, value_parser = parse_level, value_name = "LIVELLO")]
+        livello: i32,
+
+        /// Sovrascrive il file di output se esiste già
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Comprime tutti i file che corrispondono a un pattern (es. *.log)
+    Batch {
+        /// Il pattern glob da cercare (es. "*.log", "**/*.txt")
+        #[arg(value_name = "PATTERN")]
+        pattern: String,
+
+        /// Livello di compressione (da 1 a 21)
+        #[arg(short, long, default_value_t = 3, value_parser = parse_level, value_name = "LIVELLO")]
+        livello: i32,
+
+        /// Sovrascrive i file di output se esistono già
+        #[arg(short, long)]
+        force: bool,
+
+        /// Elabora i file in parallelo
+        #[arg(short, long)]
+        parallel: bool,
+    },
+    /// Verifica l'integrità di un file .zst
+    Verifica {
+        /// Il file .zst da verificare
+        #[arg(value_name = "FILE")]
+        input_file: PathBuf,
+    },
 }
 
-/// Formatta una dimensione in bytes in modo leggibile (KB o MB)
-fn format_size(bytes: u64) -> String {
-    if bytes < 1_048_576 {
-        // Meno di 1 MB, mostra in KB
-        format!("{:.2} KB", bytes as f64 / 1024.0)
-    } else {
-        // 1 MB o più, mostra in MB
-        format!("{:.2} MB", bytes as f64 / 1_048_576.0)
-    }
+/// Crea una progress bar con stile personalizzato
+fn create_progress_bar(total: u64, message: &str) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message(message.to_string());
+    pb
 }
 
-/// Calcola e formatta il ratio di compressione
-fn format_ratio(original: u64, compressed: u64) -> String {
-    if original == 0 {
-        return "N/A".to_string();
-    }
-    let ratio = (1.0 - (compressed as f64 / original as f64)) * 100.0;
-    if ratio >= 0.0 {
-        format!("{:.1}% riduzione", ratio)
-    } else {
-        format!("{:.1}% aumento", -ratio)
-    }
+/// Crea una spinner per operazioni senza dimensione nota
+fn create_spinner(message: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message(message.to_string());
+    pb
 }
 
-fn parse_level(s: &str) -> Result<i32, String> {
-    let v: i32 = s.parse().map_err(|_| {
-        format!("Valore '{}' non valido: specifica un intero tra 1 e 21", s)
-    })?;
-    if (1..=21).contains(&v) {
-        Ok(v)
-    } else {
-        Err(format!(
-            "Livello {} fuori intervallo: usa un valore tra 1 e 21",
-            v
-        ))
-    }
+/// Crea una progress bar per conteggio file
+fn create_file_progress_bar(total: u64, message: &str) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} file")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message(message.to_string());
+    pb
 }
 
 fn main() {
-    // Analizza gli argomenti della riga di comando
     let cli = Cli::parse();
 
-    // Esegue l'azione in base al sottocomando fornito (compress o decompress)
     let result = match &cli.command {
-        Commands::Compress { input_file, livello, force } => {
-            compress_file(input_file.as_path(), *livello, *force)
+        Commands::Compress {
+            input_file,
+            livello,
+            force,
+            parallel,
+        } => {
+            if input_file.is_dir() {
+                compress_directory_with_progress(input_file.as_path(), *livello, *force)
+            } else {
+                compress_file_with_progress(input_file.as_path(), *livello, *force, *parallel)
+            }
         }
         Commands::Decompress { input_file, force } => {
-            decompress_file(input_file.as_path(), *force)
+            decompress_file_with_progress(input_file.as_path(), *force)
         }
+        Commands::MultiCompress {
+            input_files,
+            output,
+            livello,
+            force,
+        } => compress_multiple_with_progress(input_files, output.as_path(), *livello, *force),
+        Commands::Batch {
+            pattern,
+            livello,
+            force,
+            parallel,
+        } => batch_compress(pattern, *livello, *force, *parallel),
+        Commands::Verifica { input_file } => verify_with_progress(input_file.as_path()),
     };
 
-    // Gestisce gli errori con exit code appropriato
     if let Err(e) = result {
         eprintln!("Errore: {}", e);
         process::exit(1);
     }
 }
 
-/// Funzione per comprimere un file
-fn compress_file(input_path: &Path, level: i32, force: bool) -> std::io::Result<()> {
-    // Verifica che il file di input esista
+/// Comprime un file con progress bar
+fn compress_file_with_progress(
+    input_path: &Path,
+    level: i32,
+    force: bool,
+    parallel: bool,
+) -> std::io::Result<()> {
     if !input_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Il file di input {:?} non esiste", input_path)
-        ));
-    }
-
-    // Costruisci il percorso di output:
-    // se il file ha estensione, aggiunge ".zst" all'estensione corrente (es. file.txt -> file.txt.zst)
-    // altrimenti imposta estensione "zst" (es. file -> file.zst)
-    let output_path = match input_path.extension() {
-        Some(ext) => {
-            let mut new_ext: OsString = ext.to_os_string();
-            new_ext.push(".zst");
-            input_path.with_extension(new_ext)
-        }
-        None => input_path.with_extension("zst"),
-    };
-    if output_path.exists() && !force {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "Il file di output {:?} esiste già. Usa --force per sovrascrivere.",
-                output_path
-            ),
+            format!("Il file di input {:?} non esiste", input_path),
         ));
     }
 
     println!("File di input: {:?}", input_path);
+    println!(
+        "Livello di compressione: {}{}",
+        level,
+        if parallel { " (modalità parallela)" } else { "" }
+    );
+
+    let input_size = std::fs::metadata(input_path)?.len();
+    let pb = create_progress_bar(input_size, "Compressione in corso...");
+    let pb_clone = pb.clone();
+
+    let options = CompressOptions::new(level)
+        .with_force(force)
+        .with_parallel(parallel)
+        .with_progress(move |bytes| {
+            pb_clone.set_position(bytes);
+        });
+
+    let result = compress_file(input_path, &options)?;
+
+    pb.finish_with_message("Compressione completata!");
+
+    println!("\n✅ Compressione completata con successo!");
+    println!(
+        "Dimensione originale: {} -> Dimensione compressa: {} ({})",
+        format_size(result.input_size),
+        format_size(result.output_size),
+        format_ratio(result.input_size, result.output_size)
+    );
+
+    Ok(())
+}
+
+/// Comprime una directory con progress bar
+fn compress_directory_with_progress(
+    dir_path: &Path,
+    level: i32,
+    force: bool,
+) -> std::io::Result<()> {
+    println!("Directory di input: {:?}", dir_path);
+    println!("Livello di compressione: {}", level);
+
+    let spinner = create_spinner("Analisi directory...");
+    let file_count = count_files_in_dir(dir_path)?;
+    spinner.finish_and_clear();
+
+    let pb = create_file_progress_bar(file_count, "Compressione directory...");
+    let pb_clone = pb.clone();
+    let processed_files = Arc::new(AtomicU64::new(0));
+    let processed_clone = Arc::clone(&processed_files);
+
+    let options = CompressOptions::new(level)
+        .with_force(force)
+        .with_progress(move |_bytes| {
+            // Incrementa il conteggio dei file
+            let files = processed_clone.fetch_add(1, Ordering::Relaxed);
+            pb_clone.set_position(files + 1);
+        });
+
+    let result = compress_directory(dir_path, &options)?;
+
+    pb.finish_with_message("Archivio creato!");
+
+    println!("\n✅ Compressione directory completata con successo!");
+    println!(
+        "File nell'archivio: {} - Dimensione archivio: {} ({})",
+        file_count,
+        format_size(result.output_size),
+        format_ratio(result.input_size, result.output_size)
+    );
+
+    Ok(())
+}
+
+/// Comprime più file con progress bar
+fn compress_multiple_with_progress(
+    input_files: &[PathBuf],
+    output_path: &Path,
+    level: i32,
+    force: bool,
+) -> std::io::Result<()> {
+    println!("File da comprimere: {} file", input_files.len());
     println!("File di output: {:?}", output_path);
     println!("Livello di compressione: {}", level);
 
-    // Usa streaming compression per file grandi
-    let input_file = File::open(input_path)?;
-    let output_file = File::create(&output_path)?;
-    
-    let mut reader = BufReader::with_capacity(64 * 1024, input_file); // 64KB buffer
-    let mut writer = BufWriter::with_capacity(64 * 1024, output_file); // 64KB buffer
-    
-    // Usa streaming encoder per evitare di caricare tutto in memoria
-    let mut encoder = zstd::Encoder::new(&mut writer, level)?;
-    std::io::copy(&mut reader, &mut encoder)?;
-    // encoder.finish() chiude l'encoder e fa automaticamente il flush del writer
-    encoder.finish()?;
+    let pb = create_file_progress_bar(input_files.len() as u64, "Compressione multi-file...");
+    let pb_clone = pb.clone();
+    let processed = Arc::new(AtomicU64::new(0));
+    let processed_clone = Arc::clone(&processed);
 
-    println!("\n✅ Compressione completata con successo!");
+    let options = CompressOptions::new(level)
+        .with_force(force)
+        .with_progress(move |_bytes| {
+            let count = processed_clone.fetch_add(1, Ordering::Relaxed);
+            pb_clone.set_position(count + 1);
+        });
 
-    // Calcola le dimensioni dei file per statistiche
-    let input_size = std::fs::metadata(input_path)?.len();
-    let output_size = std::fs::metadata(&output_path)?.len();
+    let result = compress_multiple_files(input_files, output_path, &options)?;
+
+    pb.finish_with_message("Archivio creato!");
+
+    println!("\n✅ Compressione multi-file completata con successo!");
     println!(
-        "Dimensione originale: {} -> Dimensione compressa: {} ({})",
-        format_size(input_size),
-        format_size(output_size),
-        format_ratio(input_size, output_size)
+        "Dimensione originale totale: {} -> Dimensione archivio: {} ({})",
+        format_size(result.input_size),
+        format_size(result.output_size),
+        format_ratio(result.input_size, result.output_size)
     );
 
     Ok(())
 }
 
-/// Funzione per decomprimere un file
-fn decompress_file(input_path: &Path, force: bool) -> std::io::Result<()> {
-    // Verifica che il file di input esista
+/// Decomprime un file con progress bar
+fn decompress_file_with_progress(input_path: &Path, force: bool) -> std::io::Result<()> {
     if !input_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Il file di input {:?} non esiste", input_path)
+            format!("Il file di input {:?} non esiste", input_path),
         ));
     }
 
-    // Controlla che il file abbia l'estensione .zst
-    if input_path.extension().and_then(std::ffi::OsStr::to_str) != Some("zst") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Il file di input deve avere estensione .zst"));
-    }
+    let is_tar = input_path.to_string_lossy().ends_with(".tar.zst");
 
-    // Crea il nome del file di output rimuovendo l'estensione .zst
-    // Gestisce correttamente sia "file.txt.zst" -> "file.txt" che "file.zst" -> "file"
-    let output_path = input_path.with_extension("");
     println!("File di input: {:?}", input_path);
-    println!("File di output: {:?}", output_path);
 
-    if output_path.exists() && !force {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "Il file di output {:?} esiste già. Usa --force per sovrascrivere.",
-                output_path
-            ),
-        ));
+    if is_tar {
+        let spinner = create_spinner("Estrazione archivio tar.zst...");
+        let spinner_clone = spinner.clone();
+        let file_count = Arc::new(AtomicU64::new(0));
+        let file_count_clone = Arc::clone(&file_count);
+
+        let options = DecompressOptions::new()
+            .with_force(force)
+            .with_progress(move |files| {
+                file_count_clone.store(files, Ordering::Relaxed);
+                spinner_clone.set_message(format!("Estratti {} file...", files));
+            });
+
+        let result = decompress_tar_zst(input_path, &options)?;
+        let extracted = file_count.load(Ordering::Relaxed);
+        spinner.finish_with_message(format!("Estrazione completata: {} file", extracted));
+
+        println!("\n✅ Estrazione archivio completata con successo!");
+        println!(
+            "Dimensione archivio: {} - File estratti: {}",
+            format_size(result.input_size),
+            extracted
+        );
+    } else {
+        let input_size = std::fs::metadata(input_path)?.len();
+        let pb = create_progress_bar(input_size, "Decompressione in corso...");
+        let pb_clone = pb.clone();
+
+        let options = DecompressOptions::new()
+            .with_force(force)
+            .with_progress(move |bytes| {
+                pb_clone.set_position(bytes);
+            });
+
+        let result = decompress_single_file(input_path, &options)?;
+
+        pb.finish_with_message("Decompressione completata!");
+
+        println!("\n✅ Decompressione completata con successo!");
+        println!(
+            "Dimensione compressa: {} -> Dimensione originale: {} ({})",
+            format_size(result.input_size),
+            format_size(result.output_size),
+            format_ratio(result.output_size, result.input_size)
+        );
     }
-
-    // Usa streaming decompression per file grandi
-    let input_file = File::open(input_path)?;
-    let output_file = File::create(&output_path)?;
-    
-    let mut reader = BufReader::with_capacity(64 * 1024, input_file); // 64KB buffer
-    let mut writer = BufWriter::with_capacity(64 * 1024, output_file); // 64KB buffer
-    
-    // Usa streaming decoder per evitare di caricare tutto in memoria
-    let mut decoder = zstd::Decoder::new(&mut reader)?;
-    std::io::copy(&mut decoder, &mut writer)?;
-
-    // Forza il flush del buffer
-    writer.flush()?;
-
-    println!("\n✅ Decompressione completata con successo!");
-
-    // Calcola le dimensioni dei file per statistiche
-    let input_size = std::fs::metadata(input_path)?.len();
-    let output_size = std::fs::metadata(&output_path)?.len();
-    println!(
-        "Dimensione compressa: {} -> Dimensione originale: {} ({})",
-        format_size(input_size),
-        format_size(output_size),
-        format_ratio(output_size, input_size)
-    );
 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::io::Write;
+/// Comprime tutti i file che corrispondono a un pattern glob
+fn batch_compress(pattern: &str, level: i32, force: bool, parallel: bool) -> std::io::Result<()> {
+    let files: Vec<PathBuf> = glob(pattern)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|path| path.is_file())
+        .collect();
 
-    /// Crea un file temporaneo con contenuto specifico per i test
-    fn create_temp_file(name: &str, content: &[u8]) -> PathBuf {
-        let path = std::env::temp_dir().join(name);
-        let mut file = File::create(&path).unwrap();
-        file.write_all(content).unwrap();
-        path
+    if files.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Nessun file trovato con il pattern '{}'", pattern),
+        ));
     }
 
-    /// Rimuove i file temporanei creati durante i test
-    fn cleanup_files(paths: &[&Path]) {
-        for path in paths {
-            let _ = fs::remove_file(path);
+    println!("Trovati {} file con il pattern '{}'", files.len(), pattern);
+    println!("Livello di compressione: {}", level);
+    println!(
+        "Modalità: {}",
+        if parallel { "parallela" } else { "sequenziale" }
+    );
+    println!();
+
+    let pb = create_file_progress_bar(files.len() as u64, "Compressione batch...");
+
+    let success_count = Arc::new(AtomicU64::new(0));
+    let error_count = Arc::new(AtomicU64::new(0));
+
+    if parallel {
+        let pb_ref = &pb;
+        let success_ref = &success_count;
+        let error_ref = &error_count;
+
+        files.par_iter().for_each(|file| {
+            match compress_file_simple(file, level, force) {
+                Ok(_) => {
+                    success_ref.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error_ref.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("Errore comprimendo {:?}: {}", file, e);
+                }
+            }
+            pb_ref.inc(1);
+        });
+    } else {
+        for file in &files {
+            match compress_file_simple(file, level, force) {
+                Ok(_) => {
+                    success_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("Errore comprimendo {:?}: {}", file, e);
+                }
+            }
+            pb.inc(1);
         }
     }
 
-    #[test]
-    fn test_format_size_kb() {
-        assert_eq!(format_size(512), "0.50 KB");
-        assert_eq!(format_size(1024), "1.00 KB");
-        assert_eq!(format_size(512 * 1024), "512.00 KB");
+    pb.finish_with_message("Compressione batch completata!");
+
+    let successes = success_count.load(Ordering::Relaxed);
+    let errors = error_count.load(Ordering::Relaxed);
+
+    println!("\n✅ Compressione batch completata!");
+    println!("File compressi con successo: {}", successes);
+    if errors > 0 {
+        println!("⚠️  File con errori: {}", errors);
     }
 
-    #[test]
-    fn test_format_size_mb() {
-        assert_eq!(format_size(1_048_576), "1.00 MB");
-        assert_eq!(format_size(5 * 1_048_576), "5.00 MB");
-        assert_eq!(format_size(1_572_864), "1.50 MB"); // 1.5 MB
-    }
+    Ok(())
+}
 
-    #[test]
-    fn test_format_ratio_reduction() {
-        // 50% riduzione (da 100 a 50)
-        assert_eq!(format_ratio(100, 50), "50.0% riduzione");
-        // 75% riduzione (da 100 a 25)
-        assert_eq!(format_ratio(100, 25), "75.0% riduzione");
-    }
+/// Verifica l'integrità di un file .zst con progress bar
+fn verify_with_progress(input_path: &Path) -> std::io::Result<()> {
+    println!("Verifica integrità: {:?}", input_path);
 
-    #[test]
-    fn test_format_ratio_increase() {
-        // File che aumenta di dimensione (da 100 a 150)
-        assert_eq!(format_ratio(100, 150), "50.0% aumento");
-    }
+    let input_size = std::fs::metadata(input_path)?.len();
+    let pb = create_progress_bar(input_size, "Verifica in corso...");
+    let pb_clone = pb.clone();
 
-    #[test]
-    fn test_format_ratio_zero() {
-        assert_eq!(format_ratio(0, 100), "N/A");
-    }
+    let callback: ProgressCallback = Box::new(move |bytes: u64| {
+        pb_clone.set_position(bytes);
+    });
 
-    #[test]
-    fn test_parse_level_valid() {
-        assert_eq!(parse_level("1").unwrap(), 1);
-        assert_eq!(parse_level("10").unwrap(), 10);
-        assert_eq!(parse_level("21").unwrap(), 21);
-    }
+    let result = match verify_zst(input_path, Some(&callback)) {
+        Ok(r) => {
+            pb.finish_with_message("Verifica completata!");
+            r
+        }
+        Err(e) => {
+            pb.finish_with_message("Verifica fallita!");
+            return Err(e);
+        }
+    };
 
-    #[test]
-    fn test_parse_level_invalid_range() {
-        assert!(parse_level("0").is_err());
-        assert!(parse_level("22").is_err());
-        assert!(parse_level("-1").is_err());
-    }
+    println!("\n✅ Il file è integro e valido!");
+    println!("Dimensione compressa: {}", format_size(result.compressed_size));
+    println!(
+        "Dimensione decompressa: {}",
+        format_size(result.decompressed_size)
+    );
+    println!(
+        "Ratio: {}",
+        format_ratio(result.decompressed_size, result.compressed_size)
+    );
 
-    #[test]
-    fn test_parse_level_invalid_format() {
-        assert!(parse_level("abc").is_err());
-        assert!(parse_level("").is_err());
-        assert!(parse_level("3.5").is_err());
-    }
-
-    #[test]
-    fn test_compress_decompress_roundtrip() {
-        let original_content = b"Questo e' un testo di prova per testare la compressione e decompressione.\n".repeat(100);
-        let input_path = create_temp_file("test_roundtrip.txt", &original_content);
-        let compressed_path = input_path.with_extension("txt.zst");
-        let decompressed_path = input_path.clone();
-
-        // Comprime
-        compress_file(&input_path, 3, true).unwrap();
-        assert!(compressed_path.exists());
-
-        // Rimuove il file originale per la decompressione
-        fs::remove_file(&input_path).unwrap();
-
-        // Decomprime
-        decompress_file(&compressed_path, true).unwrap();
-        assert!(decompressed_path.exists());
-
-        // Verifica che il contenuto sia identico
-        let decompressed_content = fs::read(&decompressed_path).unwrap();
-        assert_eq!(original_content, decompressed_content.as_slice());
-
-        // Cleanup
-        cleanup_files(&[&input_path, &compressed_path]);
-    }
-
-    #[test]
-    fn test_compress_file_not_found() {
-        let result = compress_file(Path::new("/tmp/file_che_non_esiste_12345.txt"), 3, false);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn test_decompress_file_not_found() {
-        let result = decompress_file(Path::new("/tmp/file_che_non_esiste_12345.zst"), false);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn test_decompress_wrong_extension() {
-        let input_path = create_temp_file("test_wrong_ext.txt", b"test content");
-
-        let result = decompress_file(&input_path, false);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-
-        cleanup_files(&[&input_path]);
-    }
-
-    #[test]
-    fn test_compress_no_force_existing_file() {
-        let input_path = create_temp_file("test_no_force.txt", b"test content");
-        let output_path = input_path.with_extension("txt.zst");
-
-        // Crea il file di output
-        File::create(&output_path).unwrap();
-
-        // Prova a comprimere senza --force
-        let result = compress_file(&input_path, 3, false);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-
-        cleanup_files(&[&input_path, &output_path]);
-    }
-
-    #[test]
-    fn test_compress_with_force_existing_file() {
-        let input_path = create_temp_file("test_with_force.txt", b"test content for force test");
-        let output_path = input_path.with_extension("txt.zst");
-
-        // Crea il file di output
-        File::create(&output_path).unwrap();
-
-        // Comprime con --force
-        let result = compress_file(&input_path, 3, true);
-        assert!(result.is_ok());
-
-        cleanup_files(&[&input_path, &output_path]);
-    }
-
-    #[test]
-    fn test_compression_levels() {
-        let content = b"Test content for compression level testing.\n".repeat(50);
-
-        // Testa livello basso (veloce, meno compressione)
-        let input_low = create_temp_file("test_level_low.txt", &content);
-        compress_file(&input_low, 1, true).unwrap();
-        let size_low = fs::metadata(input_low.with_extension("txt.zst")).unwrap().len();
-
-        // Testa livello alto (lento, più compressione)
-        let input_high = create_temp_file("test_level_high.txt", &content);
-        compress_file(&input_high, 19, true).unwrap();
-        let size_high = fs::metadata(input_high.with_extension("txt.zst")).unwrap().len();
-
-        // Il livello alto dovrebbe produrre file più piccoli o uguali
-        assert!(size_high <= size_low);
-
-        cleanup_files(&[
-            &input_low,
-            &input_low.with_extension("txt.zst"),
-            &input_high,
-            &input_high.with_extension("txt.zst"),
-        ]);
-    }
+    Ok(())
 }
