@@ -4,95 +4,87 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A command-line file compression/decompression utility written in Rust using the Zstandard (zstd) compression algorithm. The application is Italian-language focused with all user-facing messages in Italian.
+A file compression/decompression utility written in Rust using the Zstandard (zstd) compression algorithm. Provides both CLI and GUI interfaces. **All user-facing text is in Italian** (error messages, commands, help text, comments).
 
 ## Build and Development Commands
 
-### Building
 ```bash
-# Development build
-cargo build
+# Build
+cargo build                    # Debug build
+cargo build --release          # Release build (optimized)
 
-# Release build (optimized)
-cargo build --release
-
-# Build output locations:
-# - Debug: ./target/debug/file_compressor
-# - Release: ./target/release/file_compressor
-```
-
-### Running
-```bash
-# Run directly with cargo
+# Run CLI
 cargo run -- compress <file> --livello 10
 cargo run -- decompress <file.zst>
+cargo run -- multicompress file1 file2 --output archive.tar.zst
+cargo run -- batch "*.log" --livello 5
+cargo run -- verifica <file.zst>
 
-# Run the built binary
-./target/debug/file_compressor compress <file>
-./target/release/file_compressor decompress <file.zst>
-```
+# Run GUI
+cargo run --bin file_compressor_gui
 
-### Testing
-```bash
-# Run all tests
-cargo test
+# Test
+cargo test                     # Run all tests
+cargo test -- --nocapture      # With output
+cargo test <test_name>         # Specific test
 
-# Run tests with output
-cargo test -- --nocapture
-
-# Run specific test
-cargo test <test_name>
-```
-
-### Other Commands
-```bash
-# Check code without building
-cargo check
-
-# Format code
-cargo fmt
-
-# Lint with clippy
+# Lint and format
 cargo clippy
+cargo fmt
 ```
+
+**Binary outputs:**
+- CLI: `target/{debug,release}/file_compressor`
+- GUI: `target/{debug,release}/file_compressor_gui`
 
 ## Architecture
 
-### Single-File Structure
-The entire application is contained in [src/main.rs](src/main.rs). This is a simple CLI tool without complex module organization.
+### Module Structure
 
-### Key Components
+| File | Purpose |
+|------|---------|
+| [src/lib.rs](src/lib.rs) | Core compression library with all compression/decompression logic |
+| [src/main.rs](src/main.rs) | CLI application with progress bars |
+| [src/gui.rs](src/gui.rs) | egui-based GUI application |
 
-1. **CLI Parser** (lines 8-41): Uses `clap` derive macros to define the command-line interface with two subcommands:
-   - `compress`: Compresses a file with configurable compression level (1-21, default 3)
-   - `decompress`: Decompresses .zst files
+### Core Library (lib.rs)
 
-2. **Compression Logic** (lines 77-126 in `compress_file`):
-   - Uses streaming compression via `zstd::Encoder` to handle large files without loading them entirely into memory
-   - 64KB buffer size for both input and output
-   - Output file naming: appends `.zst` to the full filename (e.g., `file.txt` → `file.txt.zst`)
-   - Includes file size statistics in MB
+Key types:
+- `CompressOptions` / `DecompressOptions` - Builder pattern for operation configuration
+- `CompressionResult` - Stores input/output sizes
+- `VerifyResult` - File integrity verification result
 
-3. **Decompression Logic** (lines 129-168 in `decompress_file`):
-   - Uses streaming decompression via `zstd::Decoder`
-   - 64KB buffer size for both input and output
-   - Validates that input has `.zst` extension
-   - Output file naming: removes `.zst` extension
+Key functions:
+- `compress_file()` / `decompress_file()` - Single file operations with progress callbacks
+- `compress_directory()` - Creates tar.zst from directory
+- `compress_multiple_files()` - Bundles files into tar.zst archive
+- `verify_zst()` - Validates file integrity
 
-4. **Force Flag Behavior**: Both operations check for existing output files and error unless `--force` flag is provided
+### CLI Commands (main.rs)
+
+| Command | Description |
+|---------|-------------|
+| `compress` | Single file/directory compression (level 1-21, default 3) |
+| `decompress` | Decompress .zst or extract .tar.zst |
+| `multicompress` | Create tar.zst from multiple files |
+| `batch` | Compress files matching glob pattern (e.g., `*.log`, `**/*.txt`) |
+| `verifica` | Verify .zst file integrity |
 
 ### Dependencies
-- **zstd** (0.13): Zstandard compression library
-- **clap** (4.5): Command-line argument parser with derive feature
 
-## Language and Localization
+| Crate | Purpose |
+|-------|---------|
+| zstd | Zstandard compression |
+| clap | CLI argument parsing |
+| indicatif | Progress bars |
+| tar | TAR archive handling |
+| rayon | Parallel batch processing |
+| glob | Pattern matching for batch operations |
+| eframe/rfd | GUI framework and file dialogs |
 
-All user-facing strings, comments, and documentation are in Italian. When modifying this code:
-- Keep error messages in Italian
-- Keep command descriptions and help text in Italian
-- Keep println! output messages in Italian
-- Comments should remain in Italian
+## Design Patterns
 
-## Memory Efficiency
-
-The application uses streaming I/O throughout to handle files of any size without loading them completely into memory. When modifying file operations, maintain this streaming approach using `BufReader`, `BufWriter`, and the streaming encoder/decoder APIs.
+- **Streaming I/O**: Uses 256KB buffers with `BufReader`/`BufWriter` - never loads entire files into memory
+- **Progress callbacks**: All operations accept `Box<dyn Fn(u64) + Send>` for progress tracking
+- **Force flag**: Requires `--force` to overwrite existing files
+- **Output naming**: `file.txt` → `file.txt.zst`, directories → `dirname.tar.zst`
