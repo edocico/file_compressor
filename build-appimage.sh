@@ -53,7 +53,7 @@ fi
 
 # Crea AppImage
 echo "[4/5] Creazione AppImage..."
-ARCH=x86_64 ./appimagetool AppDir FileCompressor-x86_64.AppImage
+ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir FileCompressor-x86_64.AppImage
 
 # Pulizia
 echo "[5/5] Pulizia..."
