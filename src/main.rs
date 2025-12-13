@@ -39,6 +39,10 @@ enum Commands {
         /// Usa compressione multi-threaded per file grandi
         #[arg(short, long)]
         parallel: bool,
+
+        /// Percorso di destinazione (file o directory)
+        #[arg(short, long, value_name = "PERCORSO")]
+        output: Option<PathBuf>,
     },
     /// Decomprime un file con estensione .zst o .tar.zst
     Decompress {
@@ -49,6 +53,10 @@ enum Commands {
         /// Sovrascrive il file di output se esiste già
         #[arg(short, long)]
         force: bool,
+
+        /// Percorso di destinazione (file o directory)
+        #[arg(short, long, value_name = "PERCORSO")]
+        output: Option<PathBuf>,
     },
     /// Comprime più file in un archivio tar.zst
     MultiCompress {
@@ -141,15 +149,16 @@ fn main() {
             livello,
             force,
             parallel,
+            output,
         } => {
             if input_file.is_dir() {
-                compress_directory_with_progress(input_file.as_path(), *livello, *force)
+                compress_directory_with_progress(input_file.as_path(), *livello, *force, output.as_deref())
             } else {
-                compress_file_with_progress(input_file.as_path(), *livello, *force, *parallel)
+                compress_file_with_progress(input_file.as_path(), *livello, *force, *parallel, output.as_deref())
             }
         }
-        Commands::Decompress { input_file, force } => {
-            decompress_file_with_progress(input_file.as_path(), *force)
+        Commands::Decompress { input_file, force, output } => {
+            decompress_file_with_progress(input_file.as_path(), *force, output.as_deref())
         }
         Commands::MultiCompress {
             input_files,
@@ -178,6 +187,7 @@ fn compress_file_with_progress(
     level: i32,
     force: bool,
     parallel: bool,
+    output: Option<&Path>,
 ) -> std::io::Result<()> {
     if !input_path.exists() {
         return Err(std::io::Error::new(
@@ -187,6 +197,9 @@ fn compress_file_with_progress(
     }
 
     println!("File di input: {:?}", input_path);
+    if let Some(out) = output {
+        println!("Destinazione: {:?}", out);
+    }
     println!(
         "Livello di compressione: {}{}",
         level,
@@ -197,12 +210,16 @@ fn compress_file_with_progress(
     let pb = create_progress_bar(input_size, "Compressione in corso...");
     let pb_clone = pb.clone();
 
-    let options = CompressOptions::new(level)
+    let mut options = CompressOptions::new(level)
         .with_force(force)
         .with_parallel(parallel)
         .with_progress(move |bytes| {
             pb_clone.set_position(bytes);
         });
+
+    if let Some(out) = output {
+        options = options.with_output_path(out);
+    }
 
     let result = compress_file(input_path, &options)?;
 
@@ -224,8 +241,12 @@ fn compress_directory_with_progress(
     dir_path: &Path,
     level: i32,
     force: bool,
+    output: Option<&Path>,
 ) -> std::io::Result<()> {
     println!("Directory di input: {:?}", dir_path);
+    if let Some(out) = output {
+        println!("Destinazione: {:?}", out);
+    }
     println!("Livello di compressione: {}", level);
 
     let spinner = create_spinner("Analisi directory...");
@@ -237,13 +258,17 @@ fn compress_directory_with_progress(
     let processed_files = Arc::new(AtomicU64::new(0));
     let processed_clone = Arc::clone(&processed_files);
 
-    let options = CompressOptions::new(level)
+    let mut options = CompressOptions::new(level)
         .with_force(force)
         .with_progress(move |_bytes| {
             // Incrementa il conteggio dei file
             let files = processed_clone.fetch_add(1, Ordering::Relaxed);
             pb_clone.set_position(files + 1);
         });
+
+    if let Some(out) = output {
+        options = options.with_output_path(out);
+    }
 
     let result = compress_directory(dir_path, &options)?;
 
@@ -299,7 +324,7 @@ fn compress_multiple_with_progress(
 }
 
 /// Decomprime un file con progress bar
-fn decompress_file_with_progress(input_path: &Path, force: bool) -> std::io::Result<()> {
+fn decompress_file_with_progress(input_path: &Path, force: bool, output: Option<&Path>) -> std::io::Result<()> {
     if !input_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -310,6 +335,9 @@ fn decompress_file_with_progress(input_path: &Path, force: bool) -> std::io::Res
     let is_tar = input_path.to_string_lossy().ends_with(".tar.zst");
 
     println!("File di input: {:?}", input_path);
+    if let Some(out) = output {
+        println!("Destinazione: {:?}", out);
+    }
 
     if is_tar {
         let spinner = create_spinner("Estrazione archivio tar.zst...");
@@ -317,12 +345,16 @@ fn decompress_file_with_progress(input_path: &Path, force: bool) -> std::io::Res
         let file_count = Arc::new(AtomicU64::new(0));
         let file_count_clone = Arc::clone(&file_count);
 
-        let options = DecompressOptions::new()
+        let mut options = DecompressOptions::new()
             .with_force(force)
             .with_progress(move |files| {
                 file_count_clone.store(files, Ordering::Relaxed);
                 spinner_clone.set_message(format!("Estratti {} file...", files));
             });
+
+        if let Some(out) = output {
+            options = options.with_output_path(out);
+        }
 
         let result = decompress_tar_zst(input_path, &options)?;
         let extracted = file_count.load(Ordering::Relaxed);
@@ -339,11 +371,15 @@ fn decompress_file_with_progress(input_path: &Path, force: bool) -> std::io::Res
         let pb = create_progress_bar(input_size, "Decompressione in corso...");
         let pb_clone = pb.clone();
 
-        let options = DecompressOptions::new()
+        let mut options = DecompressOptions::new()
             .with_force(force)
             .with_progress(move |bytes| {
                 pb_clone.set_position(bytes);
             });
+
+        if let Some(out) = output {
+            options = options.with_output_path(out);
+        }
 
         let result = decompress_single_file(input_path, &options)?;
 

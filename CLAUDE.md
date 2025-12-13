@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A file compression/decompression utility written in Rust using the Zstandard (zstd) compression algorithm. Provides both CLI and GUI interfaces. **All user-facing text is in Italian** (error messages, commands, help text, comments).
+A file compression/decompression utility written in Rust using the Zstandard (zstd) compression algorithm. Provides both CLI and GUI interfaces.
+
+**Language**: CLI and library use Italian for all user-facing text (error messages, help text, comments). GUI auto-detects system locale and supports both Italian and English.
 
 ## Build and Development Commands
 
@@ -34,6 +36,7 @@ cargo fmt
 ```
 
 **Binary outputs:**
+
 - CLI: `target/{debug,release}/file_compressor`
 - GUI: `target/{debug,release}/file_compressor_gui`
 
@@ -50,11 +53,13 @@ cargo fmt
 ### Core Library (lib.rs)
 
 Key types:
+
 - `CompressOptions` / `DecompressOptions` - Builder pattern for operation configuration
 - `CompressionResult` - Stores input/output sizes
 - `VerifyResult` - File integrity verification result
 
 Key functions:
+
 - `compress_file()` / `decompress_file()` - Single file operations with progress callbacks
 - `compress_directory()` - Creates tar.zst from directory
 - `compress_multiple_files()` - Bundles files into tar.zst archive
@@ -84,7 +89,22 @@ Key functions:
 
 ## Design Patterns
 
-- **Streaming I/O**: Uses 256KB buffers with `BufReader`/`BufWriter` - never loads entire files into memory
-- **Progress callbacks**: All operations accept `Box<dyn Fn(u64) + Send>` for progress tracking
+- **Streaming I/O**: Adaptive buffer sizes (256KB for files <10MB, 1MB for larger) - never loads entire files into memory
+- **Auto-parallel**: Files ≥1MB automatically use multi-threaded compression; explicit `--parallel` flag also available
+- **Large file optimizations**: Files ≥10MB enable WindowLog(24) and long-distance matching for better compression
+- **Progress callbacks**: All operations accept `Box<dyn Fn(u64) + Send + Sync>` for progress tracking
 - **Force flag**: Requires `--force` to overwrite existing files
 - **Output naming**: `file.txt` → `file.txt.zst`, directories → `dirname.tar.zst`
+
+## Release Builds
+
+```bash
+cargo build --release              # Full LTO, optimized (slower build)
+cargo build --profile release-fast # Thin LTO, faster build
+```
+
+Multi-platform releases are automated via GitHub Actions (`.github/workflows/release.yml`) triggered by version tags (`v*`):
+
+- Linux: AppImage
+- Windows: ZIP archive
+- macOS: Universal binary DMG (Intel + Apple Silicon)

@@ -9,8 +9,30 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use tar::{Archive, Builder};
 
-/// Dimensione del buffer per operazioni I/O (256KB per migliori performance)
-pub const BUFFER_SIZE: usize = 256 * 1024;
+/// Dimensione del buffer per file piccoli (< 10MB)
+pub const BUFFER_SIZE_SMALL: usize = 256 * 1024; // 256KB
+
+/// Dimensione del buffer per file grandi (>= 10MB)
+pub const BUFFER_SIZE_LARGE: usize = 1024 * 1024; // 1MB
+
+/// Soglia per considerare un file "grande" (10MB)
+pub const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
+
+/// Soglia per abilitare automaticamente il multithreading (1MB)
+pub const AUTO_PARALLEL_THRESHOLD: u64 = 1024 * 1024;
+
+/// Restituisce la dimensione ottimale del buffer in base alla dimensione del file
+#[inline]
+pub fn optimal_buffer_size(file_size: u64) -> usize {
+    if file_size >= LARGE_FILE_THRESHOLD {
+        BUFFER_SIZE_LARGE
+    } else {
+        BUFFER_SIZE_SMALL
+    }
+}
+
+/// Mantiene compatibilità con codice esistente
+pub const BUFFER_SIZE: usize = BUFFER_SIZE_SMALL;
 
 /// Formatta una dimensione in bytes in modo leggibile (KB, MB, GB, TB)
 pub fn format_size(bytes: u64) -> String {
@@ -96,6 +118,8 @@ pub struct CompressOptions {
     pub level: i32,
     pub force: bool,
     pub parallel: bool,
+    pub auto_parallel: bool,
+    pub output_path: Option<PathBuf>,
     pub progress_callback: Option<ProgressCallback>,
 }
 
@@ -105,6 +129,8 @@ impl CompressOptions {
             level,
             force: false,
             parallel: false,
+            auto_parallel: true, // Abilitato di default per prestazioni ottimali
+            output_path: None,
             progress_callback: None,
         }
     }
@@ -119,12 +145,30 @@ impl CompressOptions {
         self
     }
 
+    /// Abilita/disabilita il multithreading automatico per file grandi
+    pub fn with_auto_parallel(mut self, auto_parallel: bool) -> Self {
+        self.auto_parallel = auto_parallel;
+        self
+    }
+
+    /// Imposta il percorso di output personalizzato
+    pub fn with_output_path<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.output_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     pub fn with_progress<F>(mut self, callback: F) -> Self
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
         self.progress_callback = Some(Box::new(callback));
         self
+    }
+
+    /// Determina se usare il multithreading in base alle opzioni e alla dimensione del file
+    #[inline]
+    pub fn should_use_parallel(&self, file_size: u64) -> bool {
+        self.parallel || (self.auto_parallel && file_size >= AUTO_PARALLEL_THRESHOLD)
     }
 }
 
@@ -137,7 +181,23 @@ pub fn compress_file(input_path: &Path, options: &CompressOptions) -> std::io::R
         ));
     }
 
-    let output_path = build_output_path(input_path);
+    // Usa output_path personalizzato se specificato, altrimenti usa il default
+    let output_path = match &options.output_path {
+        Some(p) => {
+            // Se è una directory, aggiungi il nome del file compresso
+            if p.is_dir() {
+                let file_name = input_path.file_name().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "Nome file non valido")
+                })?;
+                let mut output_name = file_name.to_os_string();
+                output_name.push(".zst");
+                p.join(output_name)
+            } else {
+                p.clone()
+            }
+        }
+        None => build_output_path(input_path),
+    };
 
     if output_path.exists() && !options.force {
         return Err(std::io::Error::new(
@@ -149,22 +209,41 @@ pub fn compress_file(input_path: &Path, options: &CompressOptions) -> std::io::R
         ));
     }
 
+    // Crea le directory padre se non esistono
+    if let Some(parent) = output_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
     let input_size = std::fs::metadata(input_path)?.len();
+
+    // Usa buffer ottimale in base alla dimensione del file
+    let buffer_size = optimal_buffer_size(input_size);
+
     let input_file = File::open(input_path)?;
     let output_file = File::create(&output_path)?;
 
-    let mut reader = BufReader::with_capacity(BUFFER_SIZE, input_file);
-    let writer = BufWriter::with_capacity(BUFFER_SIZE, output_file);
+    let mut reader = BufReader::with_capacity(buffer_size, input_file);
+    let writer = BufWriter::with_capacity(buffer_size, output_file);
 
     let mut encoder = zstd::Encoder::new(writer, options.level)?;
 
-    // Abilita multithreading se richiesto
-    if options.parallel {
+    // Abilita multithreading automatico per file grandi o se esplicitamente richiesto
+    if options.should_use_parallel(input_size) {
         encoder.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(num_cpus()))?;
     }
 
+    // Ottimizzazioni per file grandi
+    if input_size >= LARGE_FILE_THRESHOLD {
+        // Window log più grande per migliore compressione di pattern distanti
+        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(24))?; // 16MB window
+        // Long distance matching per file con pattern ripetuti
+        encoder.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true))?;
+    }
+
     // Buffer per la lettura incrementale con progress
-    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut buffer = vec![0u8; buffer_size];
     let mut total_read = 0u64;
 
     loop {
@@ -216,10 +295,21 @@ pub fn compress_directory(dir_path: &Path, options: &CompressOptions) -> std::io
     let dir_name = dir_path
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("archivio"));
-    let output_path = dir_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(format!("{}.tar.zst", dir_name.to_string_lossy()));
+
+    // Usa output_path personalizzato se specificato
+    let output_path = match &options.output_path {
+        Some(p) => {
+            if p.is_dir() {
+                p.join(format!("{}.tar.zst", dir_name.to_string_lossy()))
+            } else {
+                p.clone()
+            }
+        }
+        None => dir_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!("{}.tar.zst", dir_name.to_string_lossy())),
+    };
 
     if output_path.exists() && !options.force {
         return Err(std::io::Error::new(
@@ -231,15 +321,32 @@ pub fn compress_directory(dir_path: &Path, options: &CompressOptions) -> std::io
         ));
     }
 
+    // Crea le directory padre se non esistono
+    if let Some(parent) = output_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
     // Calcola la dimensione totale della directory
     let total_size = calculate_dir_size(dir_path)?;
 
+    // Usa buffer ottimale
+    let buffer_size = optimal_buffer_size(total_size);
+
     let output_file = File::create(&output_path)?;
-    let writer = BufWriter::with_capacity(BUFFER_SIZE, output_file);
+    let writer = BufWriter::with_capacity(buffer_size, output_file);
     let mut encoder = zstd::Encoder::new(writer, options.level)?;
 
-    if options.parallel {
+    // Abilita multithreading automatico
+    if options.should_use_parallel(total_size) {
         encoder.set_parameter(zstd::zstd_safe::CParameter::NbWorkers(num_cpus()))?;
+    }
+
+    // Ottimizzazioni per archivi grandi
+    if total_size >= LARGE_FILE_THRESHOLD {
+        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(24))?;
+        encoder.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true))?;
     }
 
     let mut tar = Builder::new(encoder);
@@ -424,6 +531,7 @@ pub fn compress_multiple_files(
 #[derive(Default)]
 pub struct DecompressOptions {
     pub force: bool,
+    pub output_path: Option<PathBuf>,
     pub progress_callback: Option<ProgressCallback>,
 }
 
@@ -434,6 +542,12 @@ impl DecompressOptions {
 
     pub fn with_force(mut self, force: bool) -> Self {
         self.force = force;
+        self
+    }
+
+    /// Imposta il percorso di output personalizzato
+    pub fn with_output_path<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.output_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -478,7 +592,23 @@ pub fn decompress_file(input_path: &Path, options: &DecompressOptions) -> std::i
 
 /// Decomprime un singolo file .zst
 pub fn decompress_single_file(input_path: &Path, options: &DecompressOptions) -> std::io::Result<CompressionResult> {
-    let output_path = input_path.with_extension("");
+    // Calcola il nome del file decompresso
+    let default_output = input_path.with_extension("");
+    let default_file_name = default_output
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Nome file non valido"))?;
+
+    // Usa output_path personalizzato se specificato
+    let output_path = match &options.output_path {
+        Some(p) => {
+            if p.is_dir() {
+                p.join(default_file_name)
+            } else {
+                p.clone()
+            }
+        }
+        None => default_output,
+    };
 
     if output_path.exists() && !options.force {
         return Err(std::io::Error::new(
@@ -490,16 +620,27 @@ pub fn decompress_single_file(input_path: &Path, options: &DecompressOptions) ->
         ));
     }
 
+    // Crea le directory padre se non esistono
+    if let Some(parent) = output_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
     let input_size = std::fs::metadata(input_path)?.len();
+
+    // Usa buffer ottimale
+    let buffer_size = optimal_buffer_size(input_size);
+
     let input_file = File::open(input_path)?;
     let output_file = File::create(&output_path)?;
 
-    let reader = BufReader::with_capacity(BUFFER_SIZE, input_file);
-    let mut writer = BufWriter::with_capacity(BUFFER_SIZE, output_file);
+    let reader = BufReader::with_capacity(buffer_size, input_file);
+    let mut writer = BufWriter::with_capacity(buffer_size, output_file);
 
     let mut decoder = zstd::Decoder::new(reader)?;
 
-    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut buffer = vec![0u8; buffer_size];
     #[allow(unused_assignments)]
     let mut total_written = 0u64;
     let mut last_progress_update = 0u64;
@@ -545,10 +686,22 @@ pub fn decompress_tar_zst(input_path: &Path, options: &DecompressOptions) -> std
         .and_then(|s| Path::new(s).file_stem())
         .unwrap_or_else(|| std::ffi::OsStr::new("output"));
 
-    let output_dir = input_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(file_stem);
+    // Usa output_path personalizzato se specificato
+    let output_dir = match &options.output_path {
+        Some(p) => {
+            if p.exists() && !p.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Per archivi tar.zst, l'output deve essere una directory",
+                ));
+            }
+            p.clone()
+        }
+        None => input_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(file_stem),
+    };
 
     if output_dir.exists() && !options.force {
         return Err(std::io::Error::new(
@@ -563,8 +716,12 @@ pub fn decompress_tar_zst(input_path: &Path, options: &DecompressOptions) -> std
     std::fs::create_dir_all(&output_dir)?;
 
     let input_size = std::fs::metadata(input_path)?.len();
+
+    // Usa buffer ottimale
+    let buffer_size = optimal_buffer_size(input_size);
+
     let input_file = File::open(input_path)?;
-    let reader = BufReader::with_capacity(BUFFER_SIZE, input_file);
+    let reader = BufReader::with_capacity(buffer_size, input_file);
     let decoder = zstd::Decoder::new(reader)?;
     let mut archive = Archive::new(decoder);
 
@@ -815,5 +972,364 @@ mod tests {
     fn test_num_cpus() {
         let cpus = num_cpus();
         assert!(cpus >= 1);
+    }
+
+    #[test]
+    fn test_optimal_buffer_size() {
+        // File piccolo
+        assert_eq!(optimal_buffer_size(1024), BUFFER_SIZE_SMALL);
+        assert_eq!(optimal_buffer_size(5 * 1024 * 1024), BUFFER_SIZE_SMALL);
+        // File grande
+        assert_eq!(optimal_buffer_size(LARGE_FILE_THRESHOLD), BUFFER_SIZE_LARGE);
+        assert_eq!(optimal_buffer_size(100 * 1024 * 1024), BUFFER_SIZE_LARGE);
+    }
+
+    #[test]
+    fn test_compress_options_builder() {
+        let options = CompressOptions::new(5)
+            .with_force(true)
+            .with_parallel(true)
+            .with_auto_parallel(false);
+
+        assert_eq!(options.level, 5);
+        assert!(options.force);
+        assert!(options.parallel);
+        assert!(!options.auto_parallel);
+    }
+
+    #[test]
+    fn test_compress_options_should_use_parallel() {
+        // Con parallel esplicito
+        let options = CompressOptions::new(3).with_parallel(true);
+        assert!(options.should_use_parallel(100)); // Qualsiasi dimensione
+
+        // Con auto_parallel e file grande
+        let options = CompressOptions::new(3).with_auto_parallel(true);
+        assert!(options.should_use_parallel(AUTO_PARALLEL_THRESHOLD));
+        assert!(!options.should_use_parallel(100));
+
+        // Con auto_parallel disabilitato
+        let options = CompressOptions::new(3).with_auto_parallel(false);
+        assert!(!options.should_use_parallel(AUTO_PARALLEL_THRESHOLD * 10));
+    }
+
+    #[test]
+    fn test_decompress_options_builder() {
+        let options = DecompressOptions::new().with_force(true);
+        assert!(options.force);
+    }
+
+    #[test]
+    fn test_compress_with_custom_output_path() {
+        let original_content = b"Test content for custom output.\n".repeat(50);
+        let input_path = create_temp_file("test_custom_output.txt", &original_content);
+
+        let output_dir = std::env::temp_dir().join("test_compress_output");
+        let _ = fs::create_dir_all(&output_dir);
+
+        let options = CompressOptions::new(3)
+            .with_force(true)
+            .with_output_path(&output_dir);
+
+        let result = compress_file(&input_path, &options);
+        assert!(result.is_ok());
+
+        let expected_output = output_dir.join("test_custom_output.txt.zst");
+        assert!(expected_output.exists());
+
+        // Cleanup
+        let _ = fs::remove_file(&input_path);
+        let _ = fs::remove_file(&expected_output);
+        let _ = fs::remove_dir(&output_dir);
+    }
+
+    #[test]
+    fn test_decompress_with_custom_output_path() {
+        let original_content = b"Test decompression with custom output.\n".repeat(50);
+        let input_path = create_temp_file("test_decompress_custom.txt", &original_content);
+        let compressed_path = input_path.with_extension("txt.zst");
+
+        // Comprimi prima
+        compress_file_simple(&input_path, 3, true).unwrap();
+
+        // Crea directory di output
+        let output_dir = std::env::temp_dir().join("test_decompress_output");
+        let _ = fs::create_dir_all(&output_dir);
+
+        // Decomprime in una directory personalizzata
+        let options = DecompressOptions::new()
+            .with_force(true)
+            .with_output_path(&output_dir);
+
+        let result = decompress_single_file(&compressed_path, &options);
+        assert!(result.is_ok());
+
+        let expected_output = output_dir.join("test_decompress_custom.txt");
+        assert!(expected_output.exists());
+
+        // Verifica contenuto
+        let decompressed_content = fs::read(&expected_output).unwrap();
+        assert_eq!(original_content, decompressed_content.as_slice());
+
+        // Cleanup
+        let _ = fs::remove_file(&input_path);
+        let _ = fs::remove_file(&compressed_path);
+        let _ = fs::remove_file(&expected_output);
+        let _ = fs::remove_dir(&output_dir);
+    }
+
+    #[test]
+    fn test_compress_file_not_found() {
+        let options = CompressOptions::new(3);
+        let result = compress_file(Path::new("/nonexistent/file.txt"), &options);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_decompress_file_not_found() {
+        let options = DecompressOptions::new();
+        let result = decompress_file(Path::new("/nonexistent/file.zst"), &options);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_decompress_invalid_extension() {
+        let input_path = create_temp_file("test_invalid_ext.txt", b"not compressed");
+        let options = DecompressOptions::new();
+        let result = decompress_file(&input_path, &options);
+        assert!(result.is_err());
+
+        let _ = fs::remove_file(&input_path);
+    }
+
+    #[test]
+    fn test_compress_file_already_exists() {
+        let original_content = b"Test content.\n".repeat(10);
+        let input_path = create_temp_file("test_exists.txt", &original_content);
+        let compressed_path = input_path.with_extension("txt.zst");
+
+        // Prima compressione
+        compress_file_simple(&input_path, 3, true).unwrap();
+        assert!(compressed_path.exists());
+
+        // Seconda compressione senza force
+        let options = CompressOptions::new(3).with_force(false);
+        let result = compress_file(&input_path, &options);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+
+        // Cleanup
+        cleanup_files(&[&input_path, &compressed_path]);
+    }
+
+    #[test]
+    fn test_verify_invalid_extension() {
+        let input_path = create_temp_file("test_verify_ext.txt", b"not compressed");
+        let result = verify_zst(&input_path, None);
+        assert!(result.is_err());
+
+        let _ = fs::remove_file(&input_path);
+    }
+
+    #[test]
+    fn test_verify_file_not_found() {
+        let result = verify_zst(Path::new("/nonexistent/file.zst"), None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_compress_directory() {
+        // Crea una directory temporanea con alcuni file
+        let test_dir = std::env::temp_dir().join("test_compress_dir");
+        let _ = fs::create_dir_all(&test_dir);
+
+        // Crea alcuni file nella directory
+        let file1 = test_dir.join("file1.txt");
+        let file2 = test_dir.join("file2.txt");
+        fs::write(&file1, b"Content of file 1").unwrap();
+        fs::write(&file2, b"Content of file 2").unwrap();
+
+        let options = CompressOptions::new(3).with_force(true);
+        let result = compress_directory(&test_dir, &options);
+        assert!(result.is_ok());
+
+        let compressed = result.unwrap();
+        assert!(compressed.input_size > 0);
+        assert!(compressed.output_size > 0);
+
+        let archive_path = std::env::temp_dir().join("test_compress_dir.tar.zst");
+        assert!(archive_path.exists());
+
+        // Cleanup
+        let _ = fs::remove_file(&file1);
+        let _ = fs::remove_file(&file2);
+        let _ = fs::remove_dir(&test_dir);
+        let _ = fs::remove_file(&archive_path);
+    }
+
+    #[test]
+    fn test_compress_directory_not_found() {
+        let options = CompressOptions::new(3);
+        let result = compress_directory(Path::new("/nonexistent/dir"), &options);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_compress_directory_is_file() {
+        let file_path = create_temp_file("test_not_dir.txt", b"I am a file");
+        let options = CompressOptions::new(3);
+        let result = compress_directory(&file_path, &options);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+
+        let _ = fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_compress_multiple_files() {
+        let content1 = b"File 1 content.\n".repeat(20);
+        let content2 = b"File 2 content.\n".repeat(20);
+
+        let file1 = create_temp_file("multi1.txt", &content1);
+        let file2 = create_temp_file("multi2.txt", &content2);
+
+        let output_path = std::env::temp_dir().join("test_multi.tar.zst");
+
+        let options = CompressOptions::new(3).with_force(true);
+        let result = compress_multiple_files(&[file1.clone(), file2.clone()], &output_path, &options);
+
+        assert!(result.is_ok());
+        assert!(output_path.exists());
+
+        // Cleanup
+        let _ = fs::remove_file(&file1);
+        let _ = fs::remove_file(&file2);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn test_compress_multiple_files_not_found() {
+        let output_path = std::env::temp_dir().join("test_multi_notfound.tar.zst");
+        let options = CompressOptions::new(3);
+        let result = compress_multiple_files(
+            &[PathBuf::from("/nonexistent/file.txt")],
+            &output_path,
+            &options,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_decompress_tar_zst() {
+        // Crea una directory con file e comprimila
+        let test_dir = std::env::temp_dir().join("test_tar_decompress_src");
+        let _ = fs::create_dir_all(&test_dir);
+
+        let file1 = test_dir.join("tarfile1.txt");
+        fs::write(&file1, b"Content in tar file").unwrap();
+
+        let options = CompressOptions::new(3).with_force(true);
+        compress_directory(&test_dir, &options).unwrap();
+
+        let archive_path = std::env::temp_dir().join("test_tar_decompress_src.tar.zst");
+
+        // Rimuovi directory originale
+        let _ = fs::remove_file(&file1);
+        let _ = fs::remove_dir(&test_dir);
+
+        // Decomprime in una nuova directory
+        let output_dir = std::env::temp_dir().join("test_tar_decompress_out");
+        let decompress_options = DecompressOptions::new()
+            .with_force(true)
+            .with_output_path(&output_dir);
+
+        let result = decompress_tar_zst(&archive_path, &decompress_options);
+        assert!(result.is_ok());
+        assert!(output_dir.exists());
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&output_dir);
+        let _ = fs::remove_file(&archive_path);
+    }
+
+    #[test]
+    fn test_calculate_dir_size() {
+        let test_dir = std::env::temp_dir().join("test_calc_size");
+        let _ = fs::create_dir_all(&test_dir);
+
+        let file1 = test_dir.join("size1.txt");
+        let file2 = test_dir.join("size2.txt");
+        fs::write(&file1, b"12345").unwrap(); // 5 bytes
+        fs::write(&file2, b"1234567890").unwrap(); // 10 bytes
+
+        let size = calculate_dir_size(&test_dir).unwrap();
+        assert_eq!(size, 15);
+
+        // Cleanup
+        let _ = fs::remove_file(&file1);
+        let _ = fs::remove_file(&file2);
+        let _ = fs::remove_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_count_files_in_dir() {
+        let test_dir = std::env::temp_dir().join("test_count_files");
+        let _ = fs::create_dir_all(&test_dir);
+
+        let file1 = test_dir.join("count1.txt");
+        let file2 = test_dir.join("count2.txt");
+        fs::write(&file1, b"1").unwrap();
+        fs::write(&file2, b"2").unwrap();
+
+        let count = count_files_in_dir(&test_dir).unwrap();
+        assert_eq!(count, 2);
+
+        // Cleanup
+        let _ = fs::remove_file(&file1);
+        let _ = fs::remove_file(&file2);
+        let _ = fs::remove_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_build_output_path() {
+        let path = Path::new("/some/file.txt");
+        let output = build_output_path(path);
+        assert_eq!(output, PathBuf::from("/some/file.txt.zst"));
+
+        let path_no_ext = Path::new("/some/file");
+        let output_no_ext = build_output_path(path_no_ext);
+        assert_eq!(output_no_ext, PathBuf::from("/some/file.zst"));
+    }
+
+    #[test]
+    fn test_compress_with_progress_callback() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let original_content = b"Progress test content.\n".repeat(100);
+        let input_path = create_temp_file("test_progress.txt", &original_content);
+
+        let progress_count = Arc::new(AtomicU64::new(0));
+        let progress_clone = Arc::clone(&progress_count);
+
+        let options = CompressOptions::new(3)
+            .with_force(true)
+            .with_progress(move |_bytes| {
+                progress_clone.fetch_add(1, Ordering::Relaxed);
+            });
+
+        let result = compress_file(&input_path, &options);
+        assert!(result.is_ok());
+
+        // La callback dovrebbe essere stata chiamata almeno una volta
+        assert!(progress_count.load(Ordering::Relaxed) >= 1);
+
+        let compressed_path = input_path.with_extension("txt.zst");
+        cleanup_files(&[&input_path, &compressed_path]);
     }
 }

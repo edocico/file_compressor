@@ -25,3 +25,18 @@ rayon = "1.10"
 glob = "0.3"
 eframe = "0.29"
 rfd = "0.15"
+sys-locale = "0.3"
+
+# Profilo release ottimizzato per massime prestazioni
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Profilo per build veloci ma con ottimizzazioni
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
