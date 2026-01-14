@@ -1,1 +1,36 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+Cargo.lock  # Optional: uncomment for libraries
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.AppImage
+appimagetool
+AppDir/
+*.dmg
+*.deb
+*.rpm
+
+# Test and temporary files
+*.zst
+*.tar.zst
+/test_files/
+/tmp/
+
+# Logs and debug
+*.log
+.env
+.env.local

@@ -132,7 +132,9 @@ fn create_file_progress_bar(total: u64, message: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} file")
+            .template(
+                "{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} file",
+            )
             .unwrap()
             .progress_chars("#>-"),
     );
@@ -141,6 +143,21 @@ fn create_file_progress_bar(total: u64, message: &str) -> ProgressBar {
 }
 
 fn main() {
+    // Setup handler SIGINT/SIGTERM per cleanup pulito
+    let running = Arc::new(AtomicU64::new(1));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        if r.load(Ordering::Relaxed) == 1 {
+            eprintln!("\n\n⚠️  Interruzione rilevata. Pulizia in corso...");
+            r.store(0, Ordering::Relaxed);
+            // Dare tempo per terminare operazioni in corso
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::process::exit(130); // 130 = 128 + SIGINT (2)
+        }
+    })
+    .expect("Errore impostando handler Ctrl-C");
+
     let cli = Cli::parse();
 
     let result = match &cli.command {
@@ -152,14 +169,27 @@ fn main() {
             output,
         } => {
             if input_file.is_dir() {
-                compress_directory_with_progress(input_file.as_path(), *livello, *force, output.as_deref())
+                compress_directory_with_progress(
+                    input_file.as_path(),
+                    *livello,
+                    *force,
+                    output.as_deref(),
+                )
             } else {
-                compress_file_with_progress(input_file.as_path(), *livello, *force, *parallel, output.as_deref())
+                compress_file_with_progress(
+                    input_file.as_path(),
+                    *livello,
+                    *force,
+                    *parallel,
+                    output.as_deref(),
+                )
             }
         }
-        Commands::Decompress { input_file, force, output } => {
-            decompress_file_with_progress(input_file.as_path(), *force, output.as_deref())
-        }
+        Commands::Decompress {
+            input_file,
+            force,
+            output,
+        } => decompress_file_with_progress(input_file.as_path(), *force, output.as_deref()),
         Commands::MultiCompress {
             input_files,
             output,
@@ -203,7 +233,11 @@ fn compress_file_with_progress(
     println!(
         "Livello di compressione: {}{}",
         level,
-        if parallel { " (modalità parallela)" } else { "" }
+        if parallel {
+            " (modalità parallela)"
+        } else {
+            ""
+        }
     );
 
     let input_size = std::fs::metadata(input_path)?.len();
@@ -324,7 +358,11 @@ fn compress_multiple_with_progress(
 }
 
 /// Decomprime un file con progress bar
-fn decompress_file_with_progress(input_path: &Path, force: bool, output: Option<&Path>) -> std::io::Result<()> {
+fn decompress_file_with_progress(
+    input_path: &Path,
+    force: bool,
+    output: Option<&Path>,
+) -> std::io::Result<()> {
     if !input_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -430,18 +468,26 @@ fn batch_compress(pattern: &str, level: i32, force: bool, parallel: bool) -> std
         let success_ref = &success_count;
         let error_ref = &error_count;
 
-        files.par_iter().for_each(|file| {
-            match compress_file_simple(file, level, force) {
-                Ok(_) => {
-                    success_ref.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    error_ref.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("Errore comprimendo {:?}: {}", file, e);
-                }
-            }
-            pb_ref.inc(1);
-        });
+        // Usa thread pool controllato per evitare sovraccarico
+        let num_threads = file_compressor::num_cpus().min(8) as usize; // Max 8 thread paralleli
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                files.par_iter().for_each(|file| {
+                    match compress_file_simple(file, level, force) {
+                        Ok(_) => {
+                            success_ref.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            error_ref.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("Errore comprimendo {:?}: {}", file, e);
+                        }
+                    }
+                    pb_ref.inc(1);
+                });
+            });
     } else {
         for file in &files {
             match compress_file_simple(file, level, force) {
@@ -495,7 +541,10 @@ fn verify_with_progress(input_path: &Path) -> std::io::Result<()> {
     };
 
     println!("\n✅ Il file è integro e valido!");
-    println!("Dimensione compressa: {}", format_size(result.compressed_size));
+    println!(
+        "Dimensione compressa: {}",
+        format_size(result.compressed_size)
+    );
     println!(
         "Dimensione decompressa: {}",
         format_size(result.decompressed_size)
