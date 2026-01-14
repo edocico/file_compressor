@@ -4,7 +4,9 @@ use file_compressor::{
     CompressOptions, DecompressOptions,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 // ============================================================================
@@ -193,11 +195,22 @@ enum Operation {
 }
 
 #[derive(Debug, Clone)]
+enum TaskMessage {
+    Progress(f32),
+    Result(TaskResult),
+}
+
+#[derive(Debug, Clone)]
 struct TaskResult {
     #[allow(dead_code)]
     success: bool,
     message: String,
     details: Vec<String>,
+}
+
+struct TaskContext {
+    progress_tx: Sender<TaskMessage>,
+    cancel_flag: Arc<AtomicU64>,
 }
 
 struct CompressorApp {
@@ -209,7 +222,8 @@ struct CompressorApp {
     output_directory: Option<PathBuf>,
     status_message: String,
     is_processing: bool,
-    result_receiver: Option<Receiver<TaskResult>>,
+    result_receiver: Option<Receiver<TaskMessage>>,
+    cancel_flag: Arc<AtomicU64>,
     progress: f32,
     show_details: bool,
     last_details: Vec<String>,
@@ -230,6 +244,7 @@ impl Default for CompressorApp {
             status_message: strings.drag_or_select.to_string(),
             is_processing: false,
             result_receiver: None,
+            cancel_flag: Arc::new(AtomicU64::new(0)),
             progress: 0.0,
             show_details: false,
             last_details: Vec::new(),
@@ -250,10 +265,11 @@ impl CompressorApp {
             return;
         }
 
-        let (tx, rx): (Sender<TaskResult>, Receiver<TaskResult>) = channel();
+        let (tx, rx): (Sender<TaskMessage>, Receiver<TaskMessage>) = channel();
         self.result_receiver = Some(rx);
         self.is_processing = true;
         self.progress = 0.0;
+        self.cancel_flag.store(0, Ordering::Relaxed);
 
         let files = self.selected_files.clone();
         let level = self.compression_level;
@@ -262,16 +278,39 @@ impl CompressorApp {
         let operation = self.operation.clone();
         let output_dir = self.output_directory.clone();
         let lang = self.language;
+        let cancel_flag = Arc::clone(&self.cancel_flag);
 
         thread::spawn(move || {
-            let result = match operation {
-                Operation::Compress => compress_files(&files, level, force, parallel, output_dir.as_deref(), lang),
-                Operation::Decompress => decompress_files(&files, force, output_dir.as_deref(), lang),
-                Operation::Verify => verify_files(&files, lang),
+            let ctx = TaskContext {
+                progress_tx: tx.clone(),
+                cancel_flag,
             };
 
-            let _ = tx.send(result);
+            let result = match operation {
+                Operation::Compress => compress_files(
+                    &files,
+                    level,
+                    force,
+                    parallel,
+                    output_dir.as_deref(),
+                    lang,
+                    &ctx,
+                ),
+                Operation::Decompress => {
+                    decompress_files(&files, force, output_dir.as_deref(), lang, &ctx)
+                }
+                Operation::Verify => verify_files(&files, lang, &ctx),
+            };
+
+            let _ = tx.send(TaskMessage::Result(result));
         });
+    }
+
+    fn cancel_operation(&mut self) {
+        if self.is_processing {
+            self.cancel_flag.store(1, Ordering::Relaxed);
+            self.status_message = "Annullamento in corso...".to_string();
+        }
     }
 }
 
@@ -289,19 +328,31 @@ impl eframe::App for CompressorApp {
                         }
                     }
                 }
-                self.status_message = format!("{} {}", self.selected_files.len(), strings.files_selected);
+                self.status_message =
+                    format!("{} {}", self.selected_files.len(), strings.files_selected);
             }
         });
 
-        // Controlla se l'operazione è completata
+        // Controlla messaggi dal worker thread
+        let mut should_clear_receiver = false;
         if let Some(ref rx) = self.result_receiver {
-            if let Ok(result) = rx.try_recv() {
-                self.is_processing = false;
-                self.progress = 1.0;
-                self.status_message = result.message;
-                self.last_details = result.details;
-                self.result_receiver = None;
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    TaskMessage::Progress(p) => {
+                        self.progress = p;
+                    }
+                    TaskMessage::Result(result) => {
+                        self.is_processing = false;
+                        self.progress = 1.0;
+                        self.status_message = result.message;
+                        self.last_details = result.details;
+                        should_clear_receiver = true;
+                    }
+                }
             }
+        }
+        if should_clear_receiver {
+            self.result_receiver = None;
         }
 
         // Pannello centrale
@@ -313,7 +364,11 @@ impl eframe::App for CompressorApp {
             ui.horizontal(|ui| {
                 ui.label(strings.operation);
                 ui.selectable_value(&mut self.operation, Operation::Compress, strings.compress);
-                ui.selectable_value(&mut self.operation, Operation::Decompress, strings.decompress);
+                ui.selectable_value(
+                    &mut self.operation,
+                    Operation::Decompress,
+                    strings.decompress,
+                );
                 ui.selectable_value(&mut self.operation, Operation::Verify, strings.verify);
             });
 
@@ -324,7 +379,10 @@ impl eframe::App for CompressorApp {
                 ui.horizontal(|ui| {
                     ui.label(strings.compression_level);
                     ui.add(egui::Slider::new(&mut self.compression_level, 1..=21));
-                    ui.label(compression_level_hint(self.compression_level, self.language));
+                    ui.label(compression_level_hint(
+                        self.compression_level,
+                        self.language,
+                    ));
                 });
 
                 ui.horizontal(|ui| {
@@ -343,7 +401,8 @@ impl eframe::App for CompressorApp {
                 ui.horizontal(|ui| {
                     ui.label(strings.destination);
                     if let Some(ref dir) = self.output_directory {
-                        let dir_name = dir.file_name()
+                        let dir_name = dir
+                            .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| dir.to_string_lossy().to_string());
                         ui.label(format!("📁 {}", dir_name));
@@ -353,7 +412,8 @@ impl eframe::App for CompressorApp {
                     } else {
                         ui.label(strings.same_folder);
                     }
-                    if ui.button(format!("📂 {}", strings.choose)).clicked() && !self.is_processing {
+                    if ui.button(format!("📂 {}", strings.choose)).clicked() && !self.is_processing
+                    {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.output_directory = Some(path);
                         }
@@ -371,7 +431,11 @@ impl eframe::App for CompressorApp {
                         ui.label(format!("📁 {}", strings.drag_files_here));
                     } else {
                         ui.vertical_centered(|ui| {
-                            ui.label(format!("📁 {} {}", self.selected_files.len(), strings.elements_selected));
+                            ui.label(format!(
+                                "📁 {} {}",
+                                self.selected_files.len(),
+                                strings.elements_selected
+                            ));
                         });
                     }
                 });
@@ -419,27 +483,37 @@ impl eframe::App for CompressorApp {
 
             // Pulsanti azione
             ui.horizontal(|ui| {
-                if ui.button(format!("📂 {}", strings.select_files)).clicked() && !self.is_processing {
+                if ui.button(format!("📂 {}", strings.select_files)).clicked()
+                    && !self.is_processing
+                {
                     if let Some(paths) = rfd::FileDialog::new().pick_files() {
                         for path in paths {
                             if !self.selected_files.contains(&path) {
                                 self.selected_files.push(path);
                             }
                         }
-                        self.status_message = format!("{} {}", self.selected_files.len(), strings.files_selected);
+                        self.status_message =
+                            format!("{} {}", self.selected_files.len(), strings.files_selected);
                     }
                 }
 
-                if ui.button(format!("📁 {}", strings.select_folder)).clicked() && !self.is_processing {
+                if ui.button(format!("📁 {}", strings.select_folder)).clicked()
+                    && !self.is_processing
+                {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         if !self.selected_files.contains(&path) {
                             self.selected_files.push(path);
                         }
-                        self.status_message = format!("{} {}", self.selected_files.len(), strings.elements_selected);
+                        self.status_message = format!(
+                            "{} {}",
+                            self.selected_files.len(),
+                            strings.elements_selected
+                        );
                     }
                 }
 
-                if ui.button(format!("🗑️ {}", strings.clear)).clicked() && !self.is_processing {
+                if ui.button(format!("🗑️ {}", strings.clear)).clicked() && !self.is_processing
+                {
                     self.selected_files.clear();
                     self.last_details.clear();
                     self.status_message = strings.drag_or_select.to_string();
@@ -455,16 +529,24 @@ impl eframe::App for CompressorApp {
                 Operation::Verify => format!("✅ {}", strings.verify_btn),
             };
 
-            ui.add_enabled_ui(!self.is_processing && !self.selected_files.is_empty(), |ui| {
-                if ui.button(button_text).clicked() {
-                    self.process_files();
-                }
-            });
+            ui.add_enabled_ui(
+                !self.is_processing && !self.selected_files.is_empty(),
+                |ui| {
+                    if ui.button(button_text).clicked() {
+                        self.process_files();
+                    }
+                },
+            );
 
-            // Progress bar
+            // Progress bar e pulsante annulla
             if self.is_processing {
                 ui.add_space(5.0);
-                ui.add(egui::ProgressBar::new(self.progress).animate(true));
+                ui.horizontal(|ui| {
+                    ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+                    if ui.button("⏹ Annulla").clicked() {
+                        self.cancel_operation();
+                    }
+                });
                 ctx.request_repaint();
             }
 
@@ -515,7 +597,15 @@ fn compression_level_hint(level: i32, lang: Language) -> &'static str {
 }
 
 /// Comprime i file selezionati
-fn compress_files(files: &[PathBuf], level: i32, force: bool, parallel: bool, output_dir: Option<&Path>, lang: Language) -> TaskResult {
+fn compress_files(
+    files: &[PathBuf],
+    level: i32,
+    force: bool,
+    parallel: bool,
+    output_dir: Option<&Path>,
+    lang: Language,
+    ctx: &TaskContext,
+) -> TaskResult {
     let strings = get_strings(lang);
     let mut success_count = 0;
     let mut error_count = 0;
@@ -531,7 +621,17 @@ fn compress_files(files: &[PathBuf], level: i32, force: bool, parallel: bool, ou
         options = options.with_output_path(dir);
     }
 
-    for file in files {
+    let total_files = files.len();
+    for (idx, file) in files.iter().enumerate() {
+        // Controlla flag cancellazione
+        if ctx.cancel_flag.load(Ordering::Relaxed) != 0 {
+            details.push("❌ Operazione annullata dall'utente".to_string());
+            break;
+        }
+
+        // Invia progress
+        let progress = (idx as f32) / (total_files as f32);
+        let _ = ctx.progress_tx.send(TaskMessage::Progress(progress));
         if file.is_dir() {
             match compress_directory(file, &options) {
                 Ok(result) => {
@@ -547,7 +647,11 @@ fn compress_files(files: &[PathBuf], level: i32, force: bool, parallel: bool, ou
                 }
                 Err(e) => {
                     error_count += 1;
-                    details.push(format!("❌ {:?}: {}", file.file_name().unwrap_or_default(), e));
+                    details.push(format!(
+                        "❌ {:?}: {}",
+                        file.file_name().unwrap_or_default(),
+                        e
+                    ));
                 }
             }
         } else {
@@ -565,14 +669,19 @@ fn compress_files(files: &[PathBuf], level: i32, force: bool, parallel: bool, ou
                 }
                 Err(e) => {
                     error_count += 1;
-                    details.push(format!("❌ {:?}: {}", file.file_name().unwrap_or_default(), e));
+                    details.push(format!(
+                        "❌ {:?}: {}",
+                        file.file_name().unwrap_or_default(),
+                        e
+                    ));
                 }
             }
         }
     }
 
     let summary = if error_count == 0 {
-        strings.compressed_elements
+        strings
+            .compressed_elements
             .replacen("{}", &success_count.to_string(), 1)
             .replacen("{}", &format_size(total_original), 1)
             .replacen("{}", &format_size(total_compressed), 1)
@@ -581,7 +690,8 @@ fn compress_files(files: &[PathBuf], level: i32, force: bool, parallel: bool, ou
     } else {
         format!(
             "⚠️ {}",
-            strings.compressed_with_errors
+            strings
+                .compressed_with_errors
                 .replacen("{}", &success_count.to_string(), 1)
                 .replacen("{}", &error_count.to_string(), 1)
         )
@@ -595,7 +705,13 @@ fn compress_files(files: &[PathBuf], level: i32, force: bool, parallel: bool, ou
 }
 
 /// Decomprime i file selezionati
-fn decompress_files(files: &[PathBuf], force: bool, output_dir: Option<&Path>, lang: Language) -> TaskResult {
+fn decompress_files(
+    files: &[PathBuf],
+    force: bool,
+    output_dir: Option<&Path>,
+    lang: Language,
+    ctx: &TaskContext,
+) -> TaskResult {
     let strings = get_strings(lang);
     let mut success_count = 0;
     let mut error_count = 0;
@@ -607,11 +723,25 @@ fn decompress_files(files: &[PathBuf], force: bool, output_dir: Option<&Path>, l
         options = options.with_output_path(dir);
     }
 
-    for file in files {
+    let total_files = files.len();
+    for (idx, file) in files.iter().enumerate() {
+        // Controlla flag cancellazione
+        if ctx.cancel_flag.load(Ordering::Relaxed) != 0 {
+            details.push("❌ Operazione annullata dall'utente".to_string());
+            break;
+        }
+
+        // Invia progress
+        let progress = (idx as f32) / (total_files as f32);
+        let _ = ctx.progress_tx.send(TaskMessage::Progress(progress));
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext != "zst" {
             error_count += 1;
-            details.push(format!("⏭️ {:?}: {}", file.file_name().unwrap_or_default(), strings.not_zst_file));
+            details.push(format!(
+                "⏭️ {:?}: {}",
+                file.file_name().unwrap_or_default(),
+                strings.not_zst_file
+            ));
             continue;
         }
 
@@ -626,7 +756,11 @@ fn decompress_files(files: &[PathBuf], force: bool, output_dir: Option<&Path>, l
             }
             Err(e) => {
                 error_count += 1;
-                details.push(format!("❌ {:?}: {}", file.file_name().unwrap_or_default(), e));
+                details.push(format!(
+                    "❌ {:?}: {}",
+                    file.file_name().unwrap_or_default(),
+                    e
+                ));
             }
         }
     }
@@ -634,12 +768,15 @@ fn decompress_files(files: &[PathBuf], force: bool, output_dir: Option<&Path>, l
     let summary = if error_count == 0 {
         format!(
             "✅ {}",
-            strings.decompressed_success.replacen("{}", &success_count.to_string(), 1)
+            strings
+                .decompressed_success
+                .replacen("{}", &success_count.to_string(), 1)
         )
     } else {
         format!(
             "⚠️ {}",
-            strings.decompressed_with_errors
+            strings
+                .decompressed_with_errors
                 .replacen("{}", &success_count.to_string(), 1)
                 .replacen("{}", &error_count.to_string(), 1)
         )
@@ -653,18 +790,32 @@ fn decompress_files(files: &[PathBuf], force: bool, output_dir: Option<&Path>, l
 }
 
 /// Verifica l'integrità dei file
-fn verify_files(files: &[PathBuf], lang: Language) -> TaskResult {
+fn verify_files(files: &[PathBuf], lang: Language, ctx: &TaskContext) -> TaskResult {
     let strings = get_strings(lang);
     let mut valid_count = 0;
     let mut invalid_count = 0;
     let mut skipped_count = 0;
     let mut details = Vec::new();
 
-    for file in files {
+    let total_files = files.len();
+    for (idx, file) in files.iter().enumerate() {
+        // Controlla flag cancellazione
+        if ctx.cancel_flag.load(Ordering::Relaxed) != 0 {
+            details.push("❌ Operazione annullata dall'utente".to_string());
+            break;
+        }
+
+        // Invia progress
+        let progress = (idx as f32) / (total_files as f32);
+        let _ = ctx.progress_tx.send(TaskMessage::Progress(progress));
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext != "zst" {
             skipped_count += 1;
-            details.push(format!("⏭️ {:?}: {}", file.file_name().unwrap_or_default(), strings.not_zst_file));
+            details.push(format!(
+                "⏭️ {:?}: {}",
+                file.file_name().unwrap_or_default(),
+                strings.not_zst_file
+            ));
             continue;
         }
 
@@ -681,7 +832,11 @@ fn verify_files(files: &[PathBuf], lang: Language) -> TaskResult {
             }
             Err(e) => {
                 invalid_count += 1;
-                details.push(format!("❌ {:?}: {}", file.file_name().unwrap_or_default(), e));
+                details.push(format!(
+                    "❌ {:?}: {}",
+                    file.file_name().unwrap_or_default(),
+                    e
+                ));
             }
         }
     }
@@ -689,19 +844,23 @@ fn verify_files(files: &[PathBuf], lang: Language) -> TaskResult {
     let summary = if invalid_count == 0 && skipped_count == 0 {
         format!(
             "✅ {}",
-            strings.files_valid.replacen("{}", &valid_count.to_string(), 1)
+            strings
+                .files_valid
+                .replacen("{}", &valid_count.to_string(), 1)
         )
     } else if invalid_count == 0 {
         format!(
             "✅ {}",
-            strings.files_valid_skipped
+            strings
+                .files_valid_skipped
                 .replacen("{}", &valid_count.to_string(), 1)
                 .replacen("{}", &skipped_count.to_string(), 1)
         )
     } else {
         format!(
             "⚠️ {}",
-            strings.files_valid_corrupt_skipped
+            strings
+                .files_valid_corrupt_skipped
                 .replacen("{}", &valid_count.to_string(), 1)
                 .replacen("{}", &invalid_count.to_string(), 1)
                 .replacen("{}", &skipped_count.to_string(), 1)

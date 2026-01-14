@@ -2,7 +2,15 @@
 name = "file_compressor"
 version = "0.2.0"
 edition = "2021"
+authors = ["edocico"]
 description = "Un programma per comprimere e decomprimere file con l'algoritmo Zstandard"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/edocico/file_compressor"
+homepage = "https://github.com/edocico/file_compressor"
+documentation = "https://github.com/edocico/file_compressor"
+keywords = ["compression", "zstd", "archiver", "cli", "gui"]
+categories = ["command-line-utilities", "compression", "filesystem"]
+readme = "README.md"
 
 [lib]
 name = "file_compressor"
@@ -26,6 +34,7 @@ glob = "0.3"
 eframe = "0.29"
 rfd = "0.15"
 sys-locale = "0.3"
+ctrlc = "3.4"
 
 # Profilo release ottimizzato per massime prestazioni
 [profile.release]
