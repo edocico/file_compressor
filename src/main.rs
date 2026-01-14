@@ -40,6 +40,10 @@ enum Commands {
         #[arg(short, long)]
         parallel: bool,
 
+        /// Disabilita ottimizzazioni intelligenti (skip file già compressi, strategia per tipo file)
+        #[arg(long)]
+        no_smart: bool,
+
         /// Percorso di destinazione (file o directory)
         #[arg(short, long, value_name = "PERCORSO")]
         output: Option<PathBuf>,
@@ -166,6 +170,7 @@ fn main() {
             livello,
             force,
             parallel,
+            no_smart,
             output,
         } => {
             if input_file.is_dir() {
@@ -173,6 +178,7 @@ fn main() {
                     input_file.as_path(),
                     *livello,
                     *force,
+                    !no_smart,
                     output.as_deref(),
                 )
             } else {
@@ -181,6 +187,7 @@ fn main() {
                     *livello,
                     *force,
                     *parallel,
+                    !no_smart,
                     output.as_deref(),
                 )
             }
@@ -217,6 +224,7 @@ fn compress_file_with_progress(
     level: i32,
     force: bool,
     parallel: bool,
+    smart_optimize: bool,
     output: Option<&Path>,
 ) -> std::io::Result<()> {
     if !input_path.exists() {
@@ -239,6 +247,9 @@ fn compress_file_with_progress(
             ""
         }
     );
+    if smart_optimize {
+        println!("🧠 Ottimizzazioni intelligenti: ATTIVE");
+    }
 
     let input_size = std::fs::metadata(input_path)?.len();
     let pb = create_progress_bar(input_size, "Compressione in corso...");
@@ -247,6 +258,7 @@ fn compress_file_with_progress(
     let mut options = CompressOptions::new(level)
         .with_force(force)
         .with_parallel(parallel)
+        .with_smart_optimize(smart_optimize)
         .with_progress(move |bytes| {
             pb_clone.set_position(bytes);
         });
@@ -275,6 +287,7 @@ fn compress_directory_with_progress(
     dir_path: &Path,
     level: i32,
     force: bool,
+    smart_optimize: bool,
     output: Option<&Path>,
 ) -> std::io::Result<()> {
     println!("Directory di input: {:?}", dir_path);
@@ -282,6 +295,9 @@ fn compress_directory_with_progress(
         println!("Destinazione: {:?}", out);
     }
     println!("Livello di compressione: {}", level);
+    if smart_optimize {
+        println!("🧠 Ottimizzazioni intelligenti: ATTIVE");
+    }
 
     let spinner = create_spinner("Analisi directory...");
     let file_count = count_files_in_dir(dir_path)?;
@@ -294,6 +310,7 @@ fn compress_directory_with_progress(
 
     let mut options = CompressOptions::new(level)
         .with_force(force)
+        .with_smart_optimize(smart_optimize)
         .with_progress(move |_bytes| {
             // Incrementa il conteggio dei file
             let files = processed_clone.fetch_add(1, Ordering::Relaxed);
