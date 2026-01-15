@@ -1,71 +1,137 @@
-name: Build Release
+# =============================================================================
+# File Compressor - Release Workflow
+# =============================================================================
+# This workflow ensures code quality before building and releasing artifacts
+# for Linux (AppImage), Windows (ZIP), and macOS (Universal DMG).
+#
+# Testing Strategy:
+# - The `test` job runs FIRST and is a prerequisite for ALL build jobs
+# - It validates: tests pass, code is formatted, clippy has no warnings
+# - If ANY check fails, the entire workflow stops immediately
+# - No release artifacts are built or published until tests pass
+# =============================================================================
+
+name: Build & Release
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:  # Permette esecuzione manuale
+  workflow_dispatch:
+
+# Prevent duplicate workflow runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal permissions - each job requests what it needs
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
+  # ===========================================================================
+  # TEST JOB - Quality Gate (MUST PASS BEFORE ANY BUILDS)
+  # ===========================================================================
+  # This job is the critical gatekeeper. All build jobs depend on it via `needs`.
+  # If tests, formatting, or linting fail, GitHub Actions will NOT run any
+  # downstream jobs, ensuring no broken code is ever released.
+  # ===========================================================================
   test:
+    name: Quality Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Cache cargo registry
+      - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
-      - name: Installa dipendenze
+      - name: Install Linux system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev
 
+      # Step 1: Verify code formatting
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt -- --check
+
+      # Step 2: Run static analysis
+      - name: Run Clippy lints
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Step 3: Run all tests
       - name: Run tests
         run: cargo test --all-features
 
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+  # ===========================================================================
+  # BUILD JOBS - Run ONLY after test job passes
+  # ===========================================================================
 
-      - name: Check formatting
-        run: cargo fmt -- --check
-
+  # ---------------------------------------------------------------------------
+  # Linux Build - AppImage
+  # ---------------------------------------------------------------------------
   build-linux:
-    needs: test
+    name: Build Linux (AppImage)
+    needs: test  # CRITICAL: Will not run if test fails
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Installa dipendenze
+      - name: Install Linux system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev
 
-      - name: Build
+      - name: Build release binaries
         run: cargo build --release
 
-      - name: Crea AppImage
+      - name: Create AppImage
         run: |
+          # Create AppDir structure
           mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          # Copy binaries
           cp target/release/file_compressor_gui AppDir/usr/bin/
           cp target/release/file_compressor AppDir/usr/bin/
 
-          # Usa PNG per l'icona (supportato da AppImage)
-          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          # Copy icon
           cp assets/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/file-compressor.png
           cp assets/icon.png AppDir/file-compressor.png
 
+          # Create .desktop file
           cat > AppDir/file-compressor.desktop << 'EOF'
           [Desktop Entry]
           Name=File Compressor
@@ -73,9 +139,11 @@ jobs:
           Icon=file-compressor
           Terminal=false
           Type=Application
-          Categories=Utility;
+          Categories=Utility;Compression;
+          Comment=Compress and decompress files with Zstandard
           EOF
 
+          # Create AppRun launcher
           cat > AppDir/AppRun << 'EOF'
           #!/bin/bash
           HERE=$(dirname "$(readlink -f "$0")")
@@ -83,77 +151,97 @@ jobs:
           EOF
           chmod +x AppDir/AppRun
 
+          # Download and run appimagetool
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir FileCompressor-Linux-x86_64.AppImage
 
-      - name: Upload artifact
+      - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-build
           path: |
             FileCompressor-Linux-x86_64.AppImage
             target/release/file_compressor
+          retention-days: 7
 
+  # ---------------------------------------------------------------------------
+  # Windows Build - ZIP Archive
+  # ---------------------------------------------------------------------------
   build-windows:
-    needs: test
+    name: Build Windows (ZIP)
+    needs: test  # CRITICAL: Will not run if test fails
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Converti PNG in ICO
+      - name: Convert PNG to ICO for Windows executable
         shell: pwsh
         run: |
-          # Usa magick (ImageMagick) per convertire PNG a ICO con multiple risoluzioni
           magick assets/icon.png -define icon:auto-resize=256,128,64,48,32,16 assets/icon.ico
 
-      - name: Build
+      - name: Build release binaries
         run: cargo build --release
 
-      - name: Crea pacchetto ZIP
+      - name: Create ZIP archive
+        shell: pwsh
         run: |
-          mkdir FileCompressor-Windows
-          cp target/release/file_compressor_gui.exe FileCompressor-Windows/
-          cp target/release/file_compressor.exe FileCompressor-Windows/
+          # Create distribution folder
+          New-Item -ItemType Directory -Force -Path FileCompressor-Windows
+
+          # Copy executables
+          Copy-Item target/release/file_compressor_gui.exe FileCompressor-Windows/
+          Copy-Item target/release/file_compressor.exe FileCompressor-Windows/
+
+          # Create ZIP archive
           Compress-Archive -Path FileCompressor-Windows -DestinationPath FileCompressor-Windows-x86_64.zip
 
-      - name: Upload artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
           path: FileCompressor-Windows-x86_64.zip
+          retention-days: 7
 
+  # ---------------------------------------------------------------------------
+  # macOS Build - Universal Binary DMG
+  # ---------------------------------------------------------------------------
   build-macos:
-    needs: test
+    name: Build macOS (Universal DMG)
+    needs: test  # CRITICAL: Will not run if test fails
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Intel
+      - name: Add cross-compilation targets
         run: |
           rustup target add x86_64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
-
-      - name: Build Apple Silicon
-        run: |
           rustup target add aarch64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin
 
-      - name: Crea icona ICNS per macOS
+      - name: Build for Intel (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build for Apple Silicon (aarch64)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Create ICNS icon for macOS
         run: |
-          # Crea iconset con tutte le dimensioni richieste
           mkdir -p AppIcon.iconset
           sips -z 16 16     assets/icon.png --out AppIcon.iconset/icon_16x16.png
           sips -z 32 32     assets/icon.png --out AppIcon.iconset/icon_16x16@2x.png
@@ -167,30 +255,40 @@ jobs:
           sips -z 1024 1024 assets/icon.png --out AppIcon.iconset/icon_512x512@2x.png
           iconutil -c icns AppIcon.iconset -o assets/AppIcon.icns
 
-      - name: Crea Universal Binary e App Bundle
+      - name: Create Universal Binary with lipo
         run: |
-          # Universal binary
           mkdir -p universal
+
+          # Combine architectures into Universal Binaries
           lipo -create \
             target/x86_64-apple-darwin/release/file_compressor_gui \
             target/aarch64-apple-darwin/release/file_compressor_gui \
             -output universal/file_compressor_gui
+
           lipo -create \
             target/x86_64-apple-darwin/release/file_compressor \
             target/aarch64-apple-darwin/release/file_compressor \
             -output universal/file_compressor
 
-          # Crea .app bundle
+          # Verify Universal Binary
+          echo "Verifying Universal Binaries:"
+          lipo -info universal/file_compressor_gui
+          lipo -info universal/file_compressor
+
+      - name: Create macOS App Bundle
+        run: |
+          # Create .app bundle structure
           mkdir -p "File Compressor.app/Contents/MacOS"
           mkdir -p "File Compressor.app/Contents/Resources"
 
+          # Copy universal binaries
           cp universal/file_compressor_gui "File Compressor.app/Contents/MacOS/"
           cp universal/file_compressor "File Compressor.app/Contents/MacOS/"
 
-          # Copia l'icona ICNS nel bundle
+          # Copy icon
           cp assets/AppIcon.icns "File Compressor.app/Contents/Resources/"
 
-          # Info.plist
+          # Create Info.plist
           cat > "File Compressor.app/Contents/Info.plist" << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -214,29 +312,52 @@ jobs:
               <string>10.13</string>
               <key>NSHighResolutionCapable</key>
               <true/>
+              <key>LSArchitecturePriority</key>
+              <array>
+                  <string>arm64</string>
+                  <string>x86_64</string>
+              </array>
           </dict>
           </plist>
           EOF
 
-          # Crea DMG
-          hdiutil create -volname "File Compressor" -srcfolder "File Compressor.app" -ov -format UDZO FileCompressor-macOS-Universal.dmg
+      - name: Create DMG installer
+        run: |
+          hdiutil create \
+            -volname "File Compressor" \
+            -srcfolder "File Compressor.app" \
+            -ov \
+            -format UDZO \
+            FileCompressor-macOS-Universal.dmg
 
-      - name: Upload artifact
+      - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-build
           path: FileCompressor-macOS-Universal.dmg
+          retention-days: 7
 
+  # ===========================================================================
+  # RELEASE JOB - Publishes artifacts only after ALL jobs succeed
+  # ===========================================================================
   create-release:
+    name: Create GitHub Release
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only create release for tags, not for manual workflow_dispatch
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write  # Required to create releases
     steps:
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
 
-      - name: Crea Release
-        uses: softprops/action-gh-release@v1
+      - name: Display artifact structure
+        run: ls -la */
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             linux-build/FileCompressor-Linux-x86_64.AppImage
@@ -244,5 +365,6 @@ jobs:
             macos-build/FileCompressor-macOS-Universal.dmg
           draft: false
           prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
