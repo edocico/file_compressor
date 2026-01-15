@@ -61,9 +61,10 @@ jobs:
           cp target/release/file_compressor_gui AppDir/usr/bin/
           cp target/release/file_compressor AppDir/usr/bin/
 
-          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
-          cp assets/icon.svg AppDir/usr/share/icons/hicolor/scalable/apps/file-compressor.svg
-          cp assets/icon.svg AppDir/file-compressor.svg
+          # Usa PNG per l'icona (supportato da AppImage)
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          cp assets/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/file-compressor.png
+          cp assets/icon.png AppDir/file-compressor.png
 
           cat > AppDir/file-compressor.desktop << 'EOF'
           [Desktop Entry]
@@ -106,6 +107,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Converti PNG in ICO
+        shell: pwsh
+        run: |
+          # Usa magick (ImageMagick) per convertire PNG a ICO con multiple risoluzioni
+          magick assets/icon.png -define icon:auto-resize=256,128,64,48,32,16 assets/icon.ico
+
       - name: Build
         run: cargo build --release
 
@@ -144,6 +151,22 @@ jobs:
           rustup target add aarch64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
 
+      - name: Crea icona ICNS per macOS
+        run: |
+          # Crea iconset con tutte le dimensioni richieste
+          mkdir -p AppIcon.iconset
+          sips -z 16 16     assets/icon.png --out AppIcon.iconset/icon_16x16.png
+          sips -z 32 32     assets/icon.png --out AppIcon.iconset/icon_16x16@2x.png
+          sips -z 32 32     assets/icon.png --out AppIcon.iconset/icon_32x32.png
+          sips -z 64 64     assets/icon.png --out AppIcon.iconset/icon_32x32@2x.png
+          sips -z 128 128   assets/icon.png --out AppIcon.iconset/icon_128x128.png
+          sips -z 256 256   assets/icon.png --out AppIcon.iconset/icon_128x128@2x.png
+          sips -z 256 256   assets/icon.png --out AppIcon.iconset/icon_256x256.png
+          sips -z 512 512   assets/icon.png --out AppIcon.iconset/icon_256x256@2x.png
+          sips -z 512 512   assets/icon.png --out AppIcon.iconset/icon_512x512.png
+          sips -z 1024 1024 assets/icon.png --out AppIcon.iconset/icon_512x512@2x.png
+          iconutil -c icns AppIcon.iconset -o assets/AppIcon.icns
+
       - name: Crea Universal Binary e App Bundle
         run: |
           # Universal binary
@@ -163,6 +186,9 @@ jobs:
 
           cp universal/file_compressor_gui "File Compressor.app/Contents/MacOS/"
           cp universal/file_compressor "File Compressor.app/Contents/MacOS/"
+
+          # Copia l'icona ICNS nel bundle
+          cp assets/AppIcon.icns "File Compressor.app/Contents/Resources/"
 
           # Info.plist
           cat > "File Compressor.app/Contents/Info.plist" << 'EOF'
