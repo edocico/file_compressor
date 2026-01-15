@@ -209,11 +209,13 @@ fn setup_custom_style(ctx: &egui::Context) {
 
     // Widget colors
     visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(240, 242, 245);
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 205, 210));
+    visuals.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 205, 210));
 
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(245, 247, 250);
     visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(245, 247, 250);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 215, 220));
+    visuals.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 215, 220));
 
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(230, 235, 242);
     visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(235, 240, 247);
@@ -434,11 +436,7 @@ impl eframe::App for CompressorApp {
                 .inner_margin(egui::Margin::same(12.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(strings.operation)
-                                .size(14.0)
-                                .strong(),
-                        );
+                        ui.label(egui::RichText::new(strings.operation).size(14.0).strong());
                         ui.add_space(8.0);
                         ui.selectable_value(
                             &mut self.operation,
@@ -469,10 +467,7 @@ impl eframe::App for CompressorApp {
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(strings.compression_level)
-                                        .size(13.0),
-                                );
+                                ui.label(egui::RichText::new(strings.compression_level).size(13.0));
                                 ui.add(
                                     egui::Slider::new(&mut self.compression_level, 1..=21)
                                         .text("")
@@ -491,8 +486,7 @@ impl eframe::App for CompressorApp {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.parallel, "");
                                 ui.label(
-                                    egui::RichText::new(strings.parallel_compression)
-                                        .size(13.0),
+                                    egui::RichText::new(strings.parallel_compression).size(13.0),
                                 );
                             });
                         });
@@ -507,9 +501,7 @@ impl eframe::App for CompressorApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.force_overwrite, "");
-                        ui.label(
-                            egui::RichText::new(strings.overwrite_existing).size(13.0),
-                        );
+                        ui.label(egui::RichText::new(strings.overwrite_existing).size(13.0));
                     });
                 });
 
@@ -523,9 +515,7 @@ impl eframe::App for CompressorApp {
                     .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(strings.destination).size(13.0).strong(),
-                            );
+                            ui.label(egui::RichText::new(strings.destination).size(13.0).strong());
                             if let Some(ref dir) = self.output_directory {
                                 let dir_name = dir
                                     .file_name()
@@ -670,7 +660,8 @@ impl eframe::App for CompressorApp {
                                                         file.to_string_lossy().to_string()
                                                     });
 
-                                                let icon = if file.is_dir() { "📁" } else { "📄" };
+                                                let icon =
+                                                    if file.is_dir() { "📁" } else { "📄" };
 
                                                 if ui
                                                     .add(
@@ -715,8 +706,7 @@ impl eframe::App for CompressorApp {
                     .add_enabled(
                         !self.is_processing,
                         egui::Button::new(
-                            egui::RichText::new(format!("📂 {}", strings.select_files))
-                                .size(13.0),
+                            egui::RichText::new(format!("📂 {}", strings.select_files)).size(13.0),
                         )
                         .min_size(egui::vec2(140.0, 32.0)),
                     )
@@ -737,8 +727,7 @@ impl eframe::App for CompressorApp {
                     .add_enabled(
                         !self.is_processing,
                         egui::Button::new(
-                            egui::RichText::new(format!("📁 {}", strings.select_folder))
-                                .size(13.0),
+                            egui::RichText::new(format!("📁 {}", strings.select_folder)).size(13.0),
                         )
                         .min_size(egui::vec2(140.0, 32.0)),
                     )
@@ -857,7 +846,10 @@ impl eframe::App for CompressorApp {
             // Status message con design migliorato
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(248, 250, 252))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 225, 230)))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(220, 225, 230),
+                ))
                 .rounding(egui::Rounding::same(10.0))
                 .inner_margin(egui::Margin::same(14.0))
                 .show(ui, |ui| {
@@ -881,11 +873,9 @@ impl eframe::App for CompressorApp {
 
                         if ui
                             .add(
-                                egui::Button::new(
-                                    egui::RichText::new(details_btn_text).size(12.0),
-                                )
-                                .small()
-                                .fill(egui::Color32::from_rgb(240, 245, 250)),
+                                egui::Button::new(egui::RichText::new(details_btn_text).size(12.0))
+                                    .small()
+                                    .fill(egui::Color32::from_rgb(240, 245, 250)),
                             )
                             .clicked()
                         {

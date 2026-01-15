@@ -11,14 +11,22 @@ fn main() {
             let mut res = winresource::WindowsResource::new();
             res.set_icon("assets/icon.ico");
             res.set("ProductName", "File Compressor");
-            res.set("FileDescription", "Compressore e decompressore file con Zstandard");
+            res.set(
+                "FileDescription",
+                "Compressore e decompressore file con Zstandard",
+            );
             res.set("LegalCopyright", "Copyright (c) 2024");
 
             if let Err(e) = res.compile() {
-                eprintln!("Errore durante la compilazione delle risorse Windows: {}", e);
+                eprintln!(
+                    "Errore durante la compilazione delle risorse Windows: {}",
+                    e
+                );
             }
         } else {
-            println!("cargo:warning=Icon file not found at assets/icon.ico - building without icon");
+            println!(
+                "cargo:warning=Icon file not found at assets/icon.ico - building without icon"
+            );
         }
     }
 }
