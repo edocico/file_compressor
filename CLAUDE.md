@@ -86,6 +86,8 @@ Key functions:
 | rayon | Parallel batch processing |
 | glob | Pattern matching for batch operations |
 | eframe/rfd | GUI framework and file dialogs |
+| sys-locale | GUI system locale detection |
+| ctrlc | Ctrl+C signal handling for graceful interruption |
 
 ## Design Patterns
 
@@ -95,6 +97,12 @@ Key functions:
 - **Progress callbacks**: All operations accept `Box<dyn Fn(u64) + Send + Sync>` for progress tracking
 - **Force flag**: Requires `--force` to overwrite existing files
 - **Output naming**: `file.txt` → `file.txt.zst`, directories → `dirname.tar.zst`
+
+## Gotchas
+
+- **Italian text in CLI/lib**: All error messages, help text, and comments must be in Italian. GUI handles both Italian/English via sys-locale.
+- **Tests require temp files**: Many tests create/delete files in temp directories; ensure cleanup on failure.
+- **Windows builds**: `build.rs` embeds Windows resources (icon, metadata) - requires `winresource` build dependency.
 
 ## Release Builds
 

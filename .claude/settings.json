@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt --quiet 2>/dev/null || true"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo clippy --quiet --message-format short 2>&1 | grep -E '^(error|warning)' | head -10 || true"
+          }
+        ]
+      }
+    ]
+  }
+}
